@@ -4,3 +4,4 @@ __pycache__/
 .env
 .DS_Store
 .claude/
+experiments/__pycache__/
