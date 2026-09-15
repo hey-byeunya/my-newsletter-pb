@@ -93,6 +93,7 @@ class Audience(BaseModel):
     묶음설명: dict[str, str] = Field(default_factory=dict)
     중요도_기준: list[str]
     버릴_것: list[str] = Field(default_factory=list)
+    버릴_낱말: list[str] = Field(default_factory=list)
     토픽: list[Topic]
     발행: Publish = Field(default_factory=Publish)
 
@@ -124,6 +125,7 @@ class Settings(BaseModel):
     tier1_max: int = 2          # 면제에도 상한이 필요하다 (섹션 4)
     per_source_max: int = 8     # 한 매체가 후보를 독차지하지 못하게
     min_body: int = 600         # G1 본문 관문 기준선 (섹션 4)
+    style_tries: int = 3        # 문체·언어 교정 호출 상한(최초 포함). 실측으로 정한 값
     model: str = "gpt-4o-mini"
     # 이름 → 키워드 목록. 종합 피드(속보·IT 전체)에서 주제에 맞는 것만 남긴다.
     filters: dict[str, list[str]] = Field(default_factory=dict)
@@ -203,6 +205,11 @@ def group_of(d: dict) -> str:
 
 
 # 선별은 여유분까지 뽑고, 발행 직전에 target 으로 줄인다. 검수가 사이에서 건수를 깎기 때문이다.
+# 버릴_것 중 낱말로 잡히는 것 — 발행 직전에 코드로 한 번 더 거른다 (섹션 10).
+# 검수는 '원문과 맞는가' 만 보므로 원문에 진짜 있는 '베스트셀러 1위' 를 통과시킨다.
+BAN = (re.compile("|".join(re.escape(w) for w in CFG.버릴_낱말), re.I)
+       if CFG.버릴_낱말 else None)
+
 OVERSELECT = max(SET.overselect, SET.target)
 MAX_PER_SOURCE = SET.max_per_source or 10**9      # 0 = 제한 없음
 
@@ -898,7 +905,7 @@ def report(s: WorkerState) -> dict:
     # 지시가 지켜졌는지 출력만 보고 확인할 수 있으면, 부탁으로 두지 않고 코드로 센다 (섹션 8)
     d = draft(it, body)
     tries = 1
-    while tries < 3:
+    while tries < SET.style_tries:
         notes = []
         if not HANGUL.search(d.summary):
             notes.append("반드시 한국어로 쓰세요. 원문이 영어여도 출력은 한국어여야 합니다.")
@@ -1080,6 +1087,13 @@ def pick_for_publish(verified: list[dict]) -> tuple[list[dict], list[str]]:
             g = group_of(d)                          # 모델 라벨이 아니라 토픽에서 계산한다
             if quota_phase and per_grp.get(g, 0) >= QUOTA.get(g, 0):
                 continue                             # 쿼터 단계에서는 넘치는 묶음을 미룬다
+            if BAN:
+                # 헤드라인·요약에 버릴 낱말이 있으면 뺀다. 검수가 못 잡는 층이다.
+                m = BAN.search(f"{d.get('headline', '')} {d.get('summary', '')}")
+                if m:
+                    dropped.append(f"{d['headline'][:32]} — 버릴 낱말('{m.group()}')")
+                    taken.add(i)
+                    continue
             if per_src.get(d["source"], 0) >= MAX_PER_SOURCE:
                 dropped.append(f"{d['headline'][:36]} — 매체 상한({d['source']} {MAX_PER_SOURCE}건)")
                 taken.add(i)                         # 한 번 떨어뜨렸으면 2차에서도 떨어진다
