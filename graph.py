@@ -362,10 +362,29 @@ def _ymd(v: str) -> datetime | None:
 
 
 def _kcisa_get(path: str, key: str, **params) -> ET.Element:
+    """공공데이터포털은 실패 사유를 본문에 담아 준다 — 상태 코드만으로는 못 고친다.
+
+    그래서 사유를 꺼내 예외 메시지에 싣는다. 키 값은 절대 싣지 않고,
+    대신 '길이와 모양'만 남긴다 — Encoding 키(%2B·%2F 포함)를 넣으면
+    requests 가 한 번 더 인코딩해 깨지는 것이 흔한 원인이라서다.
+    """
     r = requests.get(f"{KCISA_BASE}/{path}", timeout=25, headers=UA,
                      params={"serviceKey": key, **params})
-    r.raise_for_status()
-    return ET.fromstring(r.text)
+    body = r.text or ""
+    m = re.search(r"<(?:returnAuthMsg|errMsg|resultMsg)>(.*?)</(?:returnAuthMsg|errMsg|resultMsg)>", body)
+    reason = (m.group(1) if m else "").strip()
+    shape = f"키 {len(key)}자/{'인코딩형' if '%' in key else '일반형'}"
+
+    if r.status_code != 200:
+        raise RuntimeError(f"{path} HTTP {r.status_code} · {reason or body[:60]} · {shape}")
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        raise RuntimeError(f"{path} XML 아님 · {body[:60]} · {shape}") from None
+    code = root.findtext(".//resultCode")
+    if code not in (None, "00"):
+        raise RuntimeError(f"{path} resultCode={code} · {reason} · {shape}")
+    return root
 
 
 def fetch_kcisa(src: Source) -> list[dict]:
@@ -391,10 +410,6 @@ def fetch_kcisa(src: Source) -> list[dict]:
                       **{"from": today.strftime("%Y%m%d"),
                          "to": (today + timedelta(days=KCISA_DAYS)).strftime("%Y%m%d"),
                          "cPage": 1, "rows": 100, "sortStdr": 1})
-    code = root.findtext(".//resultCode")
-    if code not in (None, "00"):
-        raise RuntimeError(f"period2 resultCode={code}")
-
     # period2 는 공연·축제까지 함께 준다. 우리가 쓰는 것은 전시뿐이다.
     listed = [it for it in root.findall(".//item")
               if (it.findtext("realmName") or "").strip() in KCISA_REALMS]
