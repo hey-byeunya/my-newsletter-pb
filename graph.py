@@ -375,7 +375,10 @@ def _kcisa_get(path: str, key: str, **params) -> ET.Element:
         try:
             # (연결, 응답) 타임아웃을 나눈다. 국내 공공 API 는 해외 리전에서
             # 느리거나 아예 닿지 않는 일이 있어, 어느 쪽에서 막혔는지 구분해야 한다.
-            r = requests.get(f"{KCISA_BASE}/{path}", timeout=(10, 50), headers=UA,
+            # 연결 30초. 국내 공공 API 는 해외 리전(GitHub Actions)에서 첫 연결이
+            # 느려 10초로는 자주 놓친다 — 같은 주소가 어떤 실행에서는 403 을
+            # 돌려줬으니 막힌 게 아니라 느린 것이다.
+            r = requests.get(f"{KCISA_BASE}/{path}", timeout=(30, 60), headers=UA,
                              params={"serviceKey": key, **params})
             break
         except requests.RequestException as exc:
