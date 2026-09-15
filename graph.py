@@ -91,6 +91,9 @@ class Settings(BaseModel):
     batch: int = 40             # 예선 묶음 크기 (섹션 7)
     prelim_keep: int = 8        # 묶음당 예선 통과 수 — '묶음 운'을 줄이려고 넉넉히
     target: int = 5             # 최종 발행 목표
+    # 쿼터를 거는 자리와 결과가 정해지는 자리가 달라서 생긴 필드 두 개 (docs/발행_단계_개선점과_해결방안.md)
+    overselect: int = 0         # 선별에서 뽑을 여유분. 0 이면 target 과 같다 = 후처리 꺼짐
+    max_per_source: int = 0     # '발행분' 기준 매체 상한. 0 이면 제한 없음
     tier1_max: int = 2          # 면제에도 상한이 필요하다 (섹션 4)
     per_source_max: int = 8     # 한 매체가 후보를 독차지하지 못하게
     min_body: int = 600         # G1 본문 관문 기준선 (섹션 4)
@@ -152,6 +155,10 @@ SYS = build_sys(CFG)
 GROUPS = topic_groups(CFG)          # 묶음 → 토픽 이름들
 QUOTA = SET.quota                   # 묶음 → 최소 보장 건수
 
+# 선별은 여유분까지 뽑고, 발행 직전에 target 으로 줄인다. 검수가 사이에서 건수를 깎기 때문이다.
+OVERSELECT = max(SET.overselect, SET.target)
+MAX_PER_SOURCE = SET.max_per_source or 10**9      # 0 = 제한 없음
+
 # 선필터는 언어 모델을 부르기 전에 도는 문자열 검사다 — 비용 0, 결정론적.
 # 예선에 무관한 기사를 잔뜩 넣으면 판단이 흔들리고 토큰만 쓴다.
 FILTERS = {name: re.compile("|".join(re.escape(w) for w in words), re.I)
@@ -194,6 +201,7 @@ class Brief(TypedDict):
     picked:    list
     drafted:   Annotated[list, operator.add]    # 취재 워커들이 나눠 채운다
     verified:  list                             # 검수는 '줄이는' 일이라 키를 나눴다 (섹션 9)
+    published_items: list                       # 후처리로 확정한 실제 발행분 (검수 합격분의 부분집합)
     log:       Annotated[list, operator.add]
 
 
@@ -610,8 +618,9 @@ def select(s: dict) -> dict:
         log.append(f"   예선 묶음 {len(chunk)}건 → {len(got)}건")
     log.append(f"   예선 통과 {len(shortlist)}건 (tier1 자동통과 {len(tier1)}건 포함)")
 
-    # 본선 — 쿼터를 채우려면 target 보다 넉넉히 받아야 한다
-    final = ask_picks(shortlist, SET.target * 2 if QUOTA else SET.target, "본선")
+    # 본선 — 쿼터를 채우려면 넉넉히 받아야 한다. 여기서 뽑는 것은 '발행분' 이 아니라
+    # '취재 후보' 다. 검수에서 깎인 뒤 publish 가 최종 target 건을 확정한다.
+    final = ask_picks(shortlist, OVERSELECT * 2 if QUOTA else OVERSELECT, "본선")
 
     picked, seen_events, drops = [], set(), []
     filled = {g: 0 for g in QUOTA}
@@ -628,7 +637,7 @@ def select(s: dict) -> dict:
 
         # 묶음별 최소 보장을 먼저 채운다. 넘치는 것은 남은 자리를 놓고 겨룬다.
         g = p.group if p.group in QUOTA else None
-        if g and filled[g] < QUOTA[g] and len(picked) < SET.target:
+        if g and filled[g] < QUOTA[g] and len(picked) < OVERSELECT:
             filled[g] += 1
             picked.append(rec)
         else:
@@ -636,12 +645,14 @@ def select(s: dict) -> dict:
 
     # 한쪽 묶음이 모자라면 남은 자리를 다른 쪽으로 메운다
     for rec in overflow:
-        if len(picked) >= SET.target:
+        if len(picked) >= OVERSELECT:
             drops.append(f"{rec['title'][:40]} — 자리 없음(묶음 {rec.get('group') or '미분류'})")
             continue
         picked.append(rec)
 
-    log.insert(0, f"② 선별   {len(cands)} → {len(picked)}건")
+    log.insert(0, f"② 선별   {len(cands)} → {len(picked)}건"
+               + (f" (여유분 {OVERSELECT} · 최종 {SET.target}건은 발행 직전 확정)"
+                  if OVERSELECT > SET.target else ""))
     if QUOTA:
         got: dict[str, int] = {}
         for r in picked:
@@ -860,8 +871,44 @@ def send(embeds: list[dict], dry_run: bool) -> str:
     return str(r.status_code)          # 성공은 204 (본문 없음)
 
 
+def pick_for_publish(verified: list[dict]) -> tuple[list[dict], list[str]]:
+    """검수를 통과한 것 중에서 실제로 내보낼 것을 고른다.
+
+    선별(섹션 7)에서 쿼터를 맞춰 놓아도 검수(섹션 9)가 건수를 줄이므로
+    발행 시점에는 배분이 깨져 있다. 실측으로 두 회차 연속
+    '한 매체 과반 · 한 묶음 0건' 이 나왔다. 보장은 결과가 정해지는
+    자리에서 걸어야 한다 — 그래서 여기서 마지막으로 한 번 더 건다.
+    """
+    out, per_src, per_grp, dropped = [], {}, {}, []
+    taken = set()                                    # dict 는 해시가 안 되므로 위치로 센다
+
+    # 1차: 묶음 쿼터를 먼저 채운다   2차: 남은 자리를 순서대로 메운다
+    for quota_phase in (True, False):
+        for i, d in enumerate(verified):
+            if i in taken or len(out) >= SET.target:
+                continue
+            g = d.get("group") or "미분류"
+            if quota_phase and per_grp.get(g, 0) >= QUOTA.get(g, 0):
+                continue                             # 쿼터 단계에서는 넘치는 묶음을 미룬다
+            if per_src.get(d["source"], 0) >= MAX_PER_SOURCE:
+                dropped.append(f"{d['headline'][:36]} — 매체 상한({d['source']} {MAX_PER_SOURCE}건)")
+                taken.add(i)                         # 한 번 떨어뜨렸으면 2차에서도 떨어진다
+                continue
+            per_src[d["source"]] = per_src.get(d["source"], 0) + 1
+            per_grp[g] = per_grp.get(g, 0) + 1
+            taken.add(i)
+            out.append(d)
+
+    for i, d in enumerate(verified):                 # 자리가 모자라 못 넣은 것도 남긴다
+        if i not in taken:
+            dropped.append(f"{d['headline'][:36]} — 자리 없음({SET.target}건 초과)")
+    return out, dropped
+
+
 def publish(s: dict) -> dict:
-    items = s.get("verified") or []
+    verified = s.get("verified") or []
+    items, dropped = pick_for_publish(verified)
+
     # State 에는 body 처럼 발행에 쓰지 않는 칸이 있다 — 필요한 칸만 골라 넘긴다
     slim = [{k: d.get(k) for k in ("headline", "summary", "why", "url", "source", "topic")}
             for d in items]
@@ -869,7 +916,23 @@ def publish(s: dict) -> dict:
     code = send(build_embeds(slim), dry)
     if not dry and code[:1] == "2" and items:        # 2xx 로 실제로 나간 것만
         record_published(items)
-    return {"log": [f"⑤ 발행   {len(slim)}건 → {code}"]}
+
+    log = [f"⑤ 발행   합격 {len(verified)} → 발행 {len(slim)}건 → {code}"]
+    if QUOTA or dropped:                             # 후처리가 실제로 무엇을 했는지 남긴다
+        got: dict[str, int] = {}
+        src: dict[str, int] = {}
+        for d in items:
+            g = d.get("group") or "미분류"
+            got[g] = got.get(g, 0) + 1
+            src[d["source"]] = src.get(d["source"], 0) + 1
+        if QUOTA:
+            log.append("   쿼터: " + " · ".join(f"{g} {got.get(g, 0)}/{q}" for g, q in QUOTA.items()))
+        if src:
+            log.append("   매체: " + " · ".join(f"{k} {v}" for k, v in src.items()))
+    for d in dropped:
+        log.append(f"   − {d}")
+    # publish 만 쓰는 키다 — 리듀서 없이 덮어쓴다
+    return {"published_items": items, "log": log}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -890,7 +953,7 @@ def build():
 
 
 INIT = {"hours": SET.hours, "collected": [], "picked": [],
-        "drafted": [], "verified": [], "log": []}
+        "drafted": [], "verified": [], "published_items": [], "log": []}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -898,18 +961,41 @@ INIT = {"hours": SET.hours, "collected": [], "picked": [],
 # ─────────────────────────────────────────────────────────────
 METRICS = ROOT / "store" / "metrics.jsonl"
 
+# 자동 실행에는 화면을 보는 사람이 없다. 비밀값은 가려지는 것이 설계라(섹션 11),
+# 잘못 넣었는지 확인할 방법도 함께 사라진다. 값 대신 '모양' 만 남긴다.
+SECRET_KEYS = ("OPENAI_API_KEY", "DISCORD_WEBHOOK_URL", "KCISA_SERVICE_KEY")
+
+
+def key_shape(name: str) -> str:
+    """길이와 형태만 돌려준다. 값은 어떤 경우에도 찍지 않는다."""
+    v = os.environ.get(name, "")
+    if not v:
+        return f"{name}=없음"
+    kind = ("URL형" if v.startswith("http")
+            else "sk-형" if v.startswith("sk-")
+            else "일반형")
+    return f"{name}={len(v)}자/{kind}"
+
 
 def run(hours: int | None = None) -> dict:
     init = dict(INIT)
     if hours:
         init["hours"] = hours
 
+    # 첫 줄에 찍는다 — 키를 잘못 넣었으면 돈을 쓰기 전에 보인다
+    keys = "   · 키: " + " · ".join(key_shape(k) for k in SECRET_KEYS)
+    print(keys)
+
     started = time.time()
     out = build().compile().invoke(init)
+    out["log"] = [keys] + list(out.get("log", []))
 
+    # 집계는 '검수 합격분' 이 아니라 '실제 나간 것' 을 센다.
+    # 이 둘이 다르다는 사실 자체가 후처리를 넣은 이유다.
+    published_items = out.get("published_items", [])
     by_source: dict[str, int] = {}
     by_group: dict[str, int] = {}
-    for d in out.get("verified", []):
+    for d in published_items:
         by_source[d["source"]] = by_source.get(d["source"], 0) + 1
         g = d.get("group") or "미분류"
         by_group[g] = by_group.get(g, 0) + 1
@@ -923,13 +1009,18 @@ def run(hours: int | None = None) -> dict:
         "collected":   len(out.get("collected", [])),      # ─┐
         "picked":      len(out.get("picked", [])),         #  │ 깔때기
         "drafted":     len(out.get("drafted", [])),        #  │
-        "published":   len(out.get("verified", [])),       # ─┘
+        "verified":    len(out.get("verified", [])),       #  │ 검수 합격
+        "published":   len(published_items),               # ─┘ 후처리 후 실제 발행
         "by_source":   by_source,
         "by_group":    by_group,        # 쿼터가 실제로 채워졌는지 (계획 §7)
         # 부탁이 몇 번 중 몇 번 지켜지는지 — '프롬프트만으로 될까'에 대한 답 (섹션 8)
         "style_retry": sum(1 for d in out.get("drafted", []) if d.get("retries", 0)),
         "style_unfixed": sum(1 for d in out.get("drafted", []) if not d.get("style_ok", True)),
         "verify_fail": len(out.get("drafted", [])) - len(out.get("verified", [])),
+        # 쿼터·매체 상한 후처리가 몇 건을 걸렀는가 — overselect 값을 조정하는 근거
+        "quota_dropped": len(out.get("verified", [])) - len(published_items),
+        "overselect":  OVERSELECT,
+        "max_per_source": SET.max_per_source,
         "elapsed_sec": round(time.time() - started, 1),
         "log":         out.get("log", []),
     }
