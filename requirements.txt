@@ -3,6 +3,7 @@ feedparser>=6.0
 trafilatura>=1.12
 requests>=2.32
 PyYAML>=6.0
+python-dotenv>=1.0   # run.py 가 로컬 .env 를 읽는다. 없으면 조용히 건너뛴다
 pydantic>=2.7
 openai>=1.50
 langgraph>=0.2
