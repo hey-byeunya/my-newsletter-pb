@@ -34,7 +34,7 @@ import requests
 import trafilatura
 import yaml
 from langgraph.graph import END, START, StateGraph
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 try:                                    # langgraph 버전에 따라 위치가 다르다
     from langgraph.types import Send
@@ -65,6 +65,27 @@ class Topic(BaseModel):
     색: int = 0x0B6E77
 
 
+class Quiet(BaseModel):
+    제목: str = "{날짜}"
+    설명: str = "오늘은 조용합니다."
+
+
+class Publish(BaseModel):
+    """발행 화면에 찍히는 말. 편집 방향을 정하는 사람이 고치는 값이다.
+
+    extra="forbid" — 키를 잘못 적으면 조용히 기본값으로 도는 대신 import 에서 멈춘다.
+    '보내는이' 를 '보내는 이' 로 적어 놓고 왜 이름이 안 바뀌나 헤매는 일을 막는다.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    보내는이: str = "뉴스레터"
+    제목:    str = "{날짜} 브리핑"
+    설명:    str = "오늘 고른 소식 {건수}건"
+    날짜형식: str = "%Y년 %m월 %d일"
+    묶음표시: dict[str, str] = Field(default_factory=dict)
+    조용한날: Quiet = Field(default_factory=Quiet)
+
+
 class Audience(BaseModel):
     """audience.yaml — 편집 방향을 정하는 사람이 고치는 파일."""
     독자: dict
@@ -73,6 +94,7 @@ class Audience(BaseModel):
     중요도_기준: list[str]
     버릴_것: list[str] = Field(default_factory=list)
     토픽: list[Topic]
+    발행: Publish = Field(default_factory=Publish)
 
 
 class Source(BaseModel):
@@ -982,19 +1004,37 @@ def _color(topic: str) -> int:
     return 0x0B6E77
 
 
-def make_lead(n: int) -> dict:
-    today = datetime.now().strftime("%Y년 %m월 %d일")
-    if n == 0:
+def spread(items: list[dict]) -> str:
+    """'볼 것 2 · 갈 곳 3' — 묶음별 건수를 독자에게 보일 말로 적는다.
+
+    0건인 묶음은 뺀다. '볼 것 0' 은 읽는 사람에게 소용이 없다 —
+    쿼터가 몇 대 몇인지는 로그와 metrics 가 이미 남기고 있다.
+    """
+    got: dict[str, int] = {}
+    for d in items:
+        got[group_of(d)] = got.get(group_of(d), 0) + 1
+    label = CFG.발행.묶음표시
+    order = list(label) + [g for g in got if g not in label]   # 설정에 적은 순서대로
+    return " · ".join(f"{label.get(g, g)} {got[g]}" for g in order if got.get(g))
+
+
+def make_lead(items: list[dict]) -> dict:
+    P = CFG.발행
+    fields = {"날짜": datetime.now().strftime(P.날짜형식),
+              "배분": spread(items), "건수": len(items)}
+    if not items:
         # 아무것도 안 보내면 파이프라인이 죽은 것과 구분이 안 된다 (섹션 10·11)
-        return {"title": f"{today} 브리핑",
-                "description": "오늘은 조용합니다.",
+        return {"title": P.조용한날.제목.format(**fields),
+                "description": P.조용한날.설명.format(**fields),
                 "color": 0x6B7280}
-    return {"title": f"{today} 브리핑", "description": f"오늘 고른 소식 {n}건", "color": 0x0B6E77}
+    return {"title": P.제목.format(**fields),
+            "description": P.설명.format(**fields),
+            "color": 0x0B6E77}
 
 
 def build_embeds(items: list[dict]) -> list[dict]:
     """한 덩어리로 받았다면 이렇게 배치할 수 없었다 — 세 칸이 각자 다른 자리로 간다."""
-    embeds = [make_lead(len(items))]
+    embeds = [make_lead(items)]
     for i, d in enumerate(items[: EMBED_MAX - 1], 1):
         embeds.append({
             "title":       _cut(f"{i}. {d['headline']}", TITLE_MAX),
@@ -1017,7 +1057,7 @@ def send(embeds: list[dict], dry_run: bool) -> str:
     url = os.environ.get("DISCORD_WEBHOOK_URL", "")
     if not url:
         return "웹훅 주소 없음 — 보내지 않음"
-    r = requests.post(url, json={"username": "모두의 교양", "embeds": embeds}, timeout=15)
+    r = requests.post(url, json={"username": CFG.발행.보내는이, "embeds": embeds}, timeout=15)
     return str(r.status_code)          # 성공은 204 (본문 없음)
 
 
