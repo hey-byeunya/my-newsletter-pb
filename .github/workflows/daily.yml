@@ -1,4 +1,4 @@
-name: 매일 브리핑
+name: 오늘의 볼거리 브리핑
 
 on:
   schedule:
@@ -32,6 +32,7 @@ jobs:
         env:                     # ④ 비밀값은 여기로만 들어간다
           OPENAI_API_KEY:      ${{ secrets.OPENAI_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          KCISA_SERVICE_KEY:   ${{ secrets.KCISA_SERVICE_KEY }}
           TZ: Asia/Seoul
 
       - name: 기록 커밋        # ⑥ 임시 서버의 기록을 영구화한다 (섹션 12)

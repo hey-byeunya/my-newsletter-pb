@@ -25,6 +25,9 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, TypedDict
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+import xml.etree.ElementTree as ET
 
 import feedparser
 import requests
@@ -57,6 +60,7 @@ def _load(name: str) -> dict:
 
 class Topic(BaseModel):
     이름: str
+    묶음: str = "기타"      # 쿼터의 단위. settings.yaml 의 quota 와 이름이 맞아야 한다
     데스크지침: str = ""
     색: int = 0x0B6E77
 
@@ -64,6 +68,8 @@ class Topic(BaseModel):
 class Audience(BaseModel):
     """audience.yaml — 편집 방향을 정하는 사람이 고치는 파일."""
     독자: dict
+    # 묶음 이름만으로는 모자란다. '전시도 문화 아닌가' 로 읽혀 분류가 틀어졌다.
+    묶음설명: dict[str, str] = Field(default_factory=dict)
     중요도_기준: list[str]
     버릴_것: list[str] = Field(default_factory=list)
     토픽: list[Topic]
@@ -74,6 +80,8 @@ class Source(BaseModel):
     url: str
     kind: str = "rss"       # rss | hn   — 사다리의 몇 칸으로 가져오는가 (섹션 3)
     tier: int = 2           # 1 = 당사자 발표(경쟁 면제), 2 = 매체 (섹션 4)
+    match: str | None = None  # filters 의 이름. 종합 피드를 주제로 좁힐 때 쓴다
+    tz_offset: float | None = None  # pubDate 에 타임존이 없고 현지 시각으로 적는 발행자용
 
 
 class Settings(BaseModel):
@@ -86,6 +94,10 @@ class Settings(BaseModel):
     per_source_max: int = 8     # 한 매체가 후보를 독차지하지 못하게
     min_body: int = 600         # G1 본문 관문 기준선 (섹션 4)
     model: str = "gpt-4o-mini"
+    # 이름 → 키워드 목록. 종합 피드(속보·IT 전체)에서 주제에 맞는 것만 남긴다.
+    filters: dict[str, list[str]] = Field(default_factory=dict)
+    # 묶음 → 최소 보장 건수. 비어 있으면 중요도 순으로만 뽑는다.
+    quota: dict[str, int] = Field(default_factory=dict)
 
 
 # 오타는 프로그램이 시작하자마자 잡힌다 — 새벽 실행 중간에 터지는 것보다 낫다.
@@ -93,6 +105,14 @@ CFG = Audience(**_load("audience.yaml"))
 _raw = _load("settings.yaml")
 SOURCES = [Source(**s) for s in _raw.pop("sources", [])]
 SET = Settings(**_raw)
+
+
+def topic_groups(cfg: Audience) -> dict[str, list[str]]:
+    """묶음 → 그 묶음에 속한 토픽 이름들."""
+    out: dict[str, list[str]] = {}
+    for t in cfg.토픽:
+        out.setdefault(t.묶음, []).append(t.이름)
+    return out
 
 
 def build_criteria(cfg: Audience) -> str:
@@ -106,6 +126,13 @@ def build_criteria(cfg: Audience) -> str:
     ]
     if cfg.버릴_것:
         parts += ["[버릴 것]", *(f"  - {x}" for x in cfg.버릴_것)]
+    groups = topic_groups(cfg)
+    if len(groups) > 1:
+        parts += ["[주제 묶음] 고른 것은 반드시 아래 묶음 중 하나에 속해야 한다.",
+                  "  묶음은 '무엇을 다루는가' 가 아니라 '독자가 어떻게 접하는가' 로 가른다."]
+        for g, names in groups.items():
+            desc = cfg.묶음설명.get(g, "")
+            parts.append(f"  {g}" + (f" — {desc}" if desc else "") + f" : {', '.join(names)}")
     return "\n".join(parts)
 
 
@@ -121,6 +148,13 @@ def build_sys(cfg: Audience) -> str:
 
 CRITERIA = build_criteria(CFG)
 SYS = build_sys(CFG)
+GROUPS = topic_groups(CFG)          # 묶음 → 토픽 이름들
+QUOTA = SET.quota                   # 묶음 → 최소 보장 건수
+
+# 선필터는 언어 모델을 부르기 전에 도는 문자열 검사다 — 비용 0, 결정론적.
+# 예선에 무관한 기사를 잔뜩 넣으면 판단이 흔들리고 토큰만 쓴다.
+FILTERS = {name: re.compile("|".join(re.escape(w) for w in words), re.I)
+           for name, words in SET.filters.items() if words}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -172,6 +206,25 @@ class WorkerState(TypedDict):
 # ─────────────────────────────────────────────────────────────
 TAG_RE = re.compile(r"<[^>]+>")
 
+# 추적용 꼬리표. 이것만 떼고 나머지 쿼리는 남긴다.
+TRACKING = {"fbclid", "gclid", "igshid", "mc_cid", "mc_eid", "ref", "ref_src",
+            "spm", "cmpid", "smid", "at_medium", "at_campaign"}
+
+
+def canonical_url(url: str) -> str:
+    """중복 판정용 키.
+
+    '?' 앞을 자르는 방식은 쓸 수 없다. 한국 언론사 CMS 는 기사 번호를
+    쿼리에 넣기 때문이다(aitimes .../articleView.html?idxno=215216,
+    zdnet .../view/?no=2026...). 그렇게 자르면 한 매체의 기사 전부가
+    같은 키가 되어 한 건만 남고 조용히 사라진다.
+    """
+    p = urlsplit(url)
+    q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+         if not (k.lower().startswith("utm_") or k.lower() in TRACKING)]
+    q.sort()
+    return urlunsplit((p.scheme, p.netloc.lower(), p.path.rstrip("/"), urlencode(q), ""))
+
 
 def strip_tags(s: str | None) -> str:
     return html.unescape(TAG_RE.sub(" ", s or "")).strip()
@@ -186,7 +239,24 @@ def published_at(e) -> datetime | None:
     return None
 
 
+def _shift(at: datetime | None, offset: float | None) -> datetime | None:
+    """타임존 없이 현지 시각으로 pubDate 를 적는 발행자를 보정한다.
+
+    feedparser 는 타임존이 없는 시각을 UTC 로 읽는다. AI타임스는 KST 를
+    '2026-09-14 14:32:15' 처럼 적어서, 보정하지 않으면 모든 기사가 9시간
+    미래로 들어온다 — 시간 창을 늘 통과하고 정렬에서 늘 맨 위에 선다.
+    """
+    if at is None or not offset:
+        return at
+    return at - timedelta(hours=offset)
+
+
 UA = {"User-Agent": "Mozilla/5.0 (compatible; newsletter-agent/1.0)"}
+
+KCISA_BASE = "https://apis.data.go.kr/B553457/cultureinfo"
+KCISA_DAYS = 14          # 앞으로 며칠 안에 열려 있는 것까지 볼 것인가
+KCISA_REALMS = {"전시"}  # period2 는 공연·축제도 준다
+KCISA_DETAIL_MAX = 15    # detail2 는 건당 한 번씩 부르므로 상한을 둔다
 
 
 def fetch_rss(src: Source) -> list[dict]:
@@ -211,7 +281,7 @@ def fetch_rss(src: Source) -> list[dict]:
             "url":     link,
             "source":  src.name,
             "tier":    src.tier,
-            "at":      published_at(e),
+            "at":      _shift(published_at(e), src.tz_offset),
             "summary": strip_tags(getattr(e, "summary", ""))[:600],
         })
     return out
@@ -237,27 +307,165 @@ def fetch_hn(src: Source) -> list[dict]:
     return out
 
 
+PUBLISHED = ROOT / "store" / "published.jsonl"
+PUBLISHED_KEEP_DAYS = 90
+
+
+def published_urls() -> set[str]:
+    """이미 발행한 URL. 매일 같은 7일 창을 훑으므로 이게 없으면 같은 걸 또 보낸다."""
+    if not PUBLISHED.exists():
+        return set()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=PUBLISHED_KEEP_DAYS)
+    out = set()
+    for line in PUBLISHED.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+            at = datetime.fromisoformat(row["at"])
+        except Exception:
+            continue
+        if at >= cutoff and row.get("url"):
+            out.add(row["url"])
+    return out
+
+
+def record_published(items: list[dict]) -> None:
+    """실제로 보낸 것만 기록한다. dry-run 을 기록하면 그 항목은 영영 발행되지 않는다."""
+    PUBLISHED.parent.mkdir(exist_ok=True)
+    now = datetime.now(timezone.utc).isoformat()
+    with PUBLISHED.open("a", encoding="utf-8") as f:
+        for d in items:
+            f.write(json.dumps({"url": canonical_url(d["url"]), "at": now,
+                                "headline": d.get("headline", "")},
+                               ensure_ascii=False) + "\n")
+
+
+def _kv(d: dict, *keys) -> str:
+    """응답 필드명이 판본마다 달라 후보를 순서대로 훑는다."""
+    for k in keys:
+        v = d.get(k)
+        if v not in (None, "", [], {}):
+            return str(v).strip()
+    return ""
+
+
+def _ymd(v: str) -> datetime | None:
+    digits = re.sub(r"[^0-9]", "", str(v))[:8]
+    if len(digits) != 8:
+        return None
+    try:
+        return datetime.strptime(digits, "%Y%m%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _kcisa_get(path: str, key: str, **params) -> ET.Element:
+    r = requests.get(f"{KCISA_BASE}/{path}", timeout=25, headers=UA,
+                     params={"serviceKey": key, **params})
+    r.raise_for_status()
+    return ET.fromstring(r.text)
+
+
+def fetch_kcisa(src: Source) -> list[dict]:
+    """사다리 1칸 — 한국문화정보원 '한눈에보는문화정보' (공공데이터포털).
+
+    국내 전시는 RSS 가 거의 없어(네오룩·MMCA·아트맵 전부 404) 1칸으로 올라간다.
+
+    두 번 부른다.
+      period2 : 기간 안의 문화정보 목록. 제목·장소·지역·기간을 준다.
+      detail2 : 그중 고른 것의 상세. 여기에만 실제 전시 페이지 url 이 있다.
+    설명(contents1)은 열 중 셋만 채워져 있고 길어야 380자라 그것만으로는
+    G1 을 넘지 못한다. 대신 url 이 100% 있어서 그 페이지에서 본문을 뽑는다.
+
+    이 소스만 시간 창의 예외다. 전시에는 '발행 시각' 이 없고 기간이 있다.
+    그래서 at 을 '지금' 으로 채워 창을 통과시키고, 기간은 period2 가 걸러 준다.
+    """
+    key = os.environ.get("KCISA_SERVICE_KEY", "")
+    if not key:
+        raise RuntimeError("KCISA_SERVICE_KEY 없음")
+
+    today = datetime.now()
+    root = _kcisa_get("period2", key,
+                      **{"from": today.strftime("%Y%m%d"),
+                         "to": (today + timedelta(days=KCISA_DAYS)).strftime("%Y%m%d"),
+                         "cPage": 1, "rows": 100, "sortStdr": 1})
+    code = root.findtext(".//resultCode")
+    if code not in (None, "00"):
+        raise RuntimeError(f"period2 resultCode={code}")
+
+    # period2 는 공연·축제까지 함께 준다. 우리가 쓰는 것은 전시뿐이다.
+    listed = [it for it in root.findall(".//item")
+              if (it.findtext("realmName") or "").strip() in KCISA_REALMS]
+
+    now = datetime.now(timezone.utc)
+    out: list[dict] = []
+    for it in listed[:KCISA_DETAIL_MAX]:
+        seq = (it.findtext("seq") or "").strip()
+        if not seq:
+            continue
+        try:
+            d = _kcisa_get("detail2", key, seq=seq).find(".//item")
+        except Exception:
+            continue
+        if d is None:
+            continue
+        g = lambda t: html.unescape((d.findtext(t) or "").strip())   # noqa: E731
+
+        url = g("url")
+        if not url:
+            continue          # 어디서 볼 수 있는지 댈 수 없으면 싣지 않는다
+
+        title = g("title") or (it.findtext("title") or "").strip()
+        period = f"{g('startDate')}~{g('endDate')}"
+        where = " ".join(x for x in (g("area"), g("sigungu"), g("place")) if x)
+        info = " · ".join(x for x in (where, period, g("price")) if x)
+        out.append({
+            "title": title,
+            "url": url,
+            "source": src.name,
+            "tier": src.tier,
+            "at": now,                      # 발행 시각 개념이 없다 — docstring 참고
+            "summary": (info + " " + g("contents1"))[:600],
+            # 상세페이지 추출이 실패할 때 쓸 대체 본문
+            "body_hint": f"{title}\n{info}\n주소: {g('placeAddr')}\n\n{g('contents1')}",
+        })
+    return out
+
+
 def collect(s: dict) -> dict:
     hours = s.get("hours") or SET.hours
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
 
-    total, dup = 0, 0
+    total, dup, off, seen_before = 0, 0, 0, 0
+    off_by: dict[str, int] = {}
+    already = published_urls()
     fresh: list[dict] = []
     dead: list[str] = []
     seen: set[str] = set()
 
     for src in SOURCES:
         try:
-            raw = fetch_hn(src) if src.kind == "hn" else fetch_rss(src)
+            raw = ({"hn": fetch_hn, "kcisa": fetch_kcisa}
+                   .get(src.kind, fetch_rss))(src)
         except Exception as exc:
             dead.append(f"{src.name}({type(exc).__name__})")   # 한 곳이 죽어도 나머지는 모인다
             continue
         total += len(raw)
+        pat = FILTERS.get(src.match) if src.match else None
         for it in raw:
             at = it["at"]
             if not at or at < cutoff:                 # 시간 창 + 날짜 없는 항목
                 continue
-            key = it["url"].split("?")[0]             # utm_* 꼬리표를 떼고 비교한다
+            if pat and not pat.search(f"{it['title']} {it['summary']}"):
+                off += 1                              # 주제 밖 — 걸러낸 건수를 남긴다
+                off_by[src.name] = off_by.get(src.name, 0) + 1
+                continue
+            key = canonical_url(it["url"])            # 추적 꼬리표만 떼고 비교한다
+            if key in already:                        # 지난 실행에서 이미 보낸 것
+                seen_before += 1
+                continue
             if key in seen:
                 dup += 1
                 continue
@@ -275,8 +483,11 @@ def collect(s: dict) -> dict:
         per[it["source"]] = per.get(it["source"], 0) + 1
         kept.append(it)
 
-    log = [f"① 수집   전체 {total} → 창({hours}h) {len(fresh) + dup} "
-           f"→ 중복 -{dup} → 상한 -{capped} → 후보 {len(kept)}건"]
+    log = [f"① 수집   전체 {total} → 창({hours}h) {len(fresh) + dup + off + seen_before} "
+           f"→ 주제밖 -{off} → 기발행 -{seen_before} → 중복 -{dup} "
+           f"→ 상한 -{capped} → 후보 {len(kept)}건"]
+    if off_by:
+        log.append("   · 선필터: " + ", ".join(f"{k} -{v}" for k, v in off_by.items()))
     if dead:
         # 이 한 줄이 없으면 소스가 조용히 빠진 채 매일 '성공'한다. (섹션 5)
         log.append(f"   · 응답 없음: {', '.join(dead)}")
@@ -288,7 +499,14 @@ def collect(s: dict) -> dict:
 # ─────────────────────────────────────────────────────────────
 class Pick(BaseModel):
     index: int = Field(description="후보 목록에서 고른 기사의 번호")
-    event: str = Field(description="사건 라벨. 같은 사건을 다룬 기사에는 반드시 같은 라벨을 쓸 것")
+    # 라벨이 넓으면 서로 다른 작품이 한 덩어리로 묶여 잘린다.
+    # 실제로 다른 건축물 두 건이 '건축 디스플레이' 로 묶여 탈락한 적이 있다.
+    event: str = Field(description="작품·전시·책 하나를 식별하는 고유한 이름(제목·전시명). "
+                                   "장르나 분야가 아니다. 같은 대상을 다룬 기사끼리만 같은 라벨을 쓸 것")
+    # default 를 주면 구조화 출력에서 '선택 필드' 가 되어 모델이 통째로 생략한다.
+    # 필수로 두고, 값도 enum 으로 못박는다 — 부탁이 아니라 스키마로 강제한다.
+    group: str = Field(description=f"주제 묶음. 반드시 다음 중 하나: {' | '.join(GROUPS)}",
+                       json_schema_extra={"enum": list(GROUPS)})
     why:   str = Field(description="고른 이유 한 줄")
 
 
@@ -345,10 +563,12 @@ def select(s: dict) -> dict:
         log.append(f"   예선 묶음 {len(chunk)}건 → {len(got)}건")
     log.append(f"   예선 통과 {len(shortlist)}건 (tier1 자동통과 {len(tier1)}건 포함)")
 
-    # 본선 — 예선 통과분이면 한 화면에 놓을 수 있다
-    final = ask_picks(shortlist, SET.target, "본선")
+    # 본선 — 쿼터를 채우려면 target 보다 넉넉히 받아야 한다
+    final = ask_picks(shortlist, SET.target * 2 if QUOTA else SET.target, "본선")
 
     picked, seen_events, drops = [], set(), []
+    filled = {g: 0 for g in QUOTA}
+    overflow: list[dict] = []
     for p in final.picks:
         it = shortlist[p.index]
         ev = (p.event or it["title"]).strip().lower()
@@ -357,9 +577,31 @@ def select(s: dict) -> dict:
             drops.append(f"{it['title'][:40]} — 같은 사건 중복({ev})")
             continue
         seen_events.add(ev)
-        picked.append(dict(it, event=p.event, pick_why=p.why))
+        rec = dict(it, event=p.event, pick_why=p.why, group=p.group)
+
+        # 묶음별 최소 보장을 먼저 채운다. 넘치는 것은 남은 자리를 놓고 겨룬다.
+        g = p.group if p.group in QUOTA else None
+        if g and filled[g] < QUOTA[g] and len(picked) < SET.target:
+            filled[g] += 1
+            picked.append(rec)
+        else:
+            overflow.append(rec)
+
+    # 한쪽 묶음이 모자라면 남은 자리를 다른 쪽으로 메운다
+    for rec in overflow:
+        if len(picked) >= SET.target:
+            drops.append(f"{rec['title'][:40]} — 자리 없음(묶음 {rec.get('group') or '미분류'})")
+            continue
+        picked.append(rec)
 
     log.insert(0, f"② 선별   {len(cands)} → {len(picked)}건")
+    if QUOTA:
+        got: dict[str, int] = {}
+        for r in picked:
+            got[r.get("group") or "미분류"] = got.get(r.get("group") or "미분류", 0) + 1
+        want = " · ".join(f"{g} {got.get(g, 0)}/{q}" for g, q in QUOTA.items())
+        extra = got.get("미분류", 0)
+        log.insert(1, f"   쿼터: {want}" + (f" · 미분류 {extra}" if extra else ""))
     # 탈락 사유가 없으면 선별이 잘못됐을 때 무엇을 고칠지 알 수 없다
     for d in drops + final.drops:
         log.append(f"   − {d}")
@@ -379,6 +621,18 @@ class Draft(BaseModel):
 
 
 HANGUL = re.compile(r"[가-힣]")
+SENT_END = re.compile(r"[.!?]+\s*")
+POLITE = ("니다", "니까", "세요", "십시오")
+
+
+def is_polite(text: str) -> bool:
+    """'~합니다'체인지 문장 끝으로 판정한다.
+
+    문체는 프롬프트에 두 군데나 적어도 지켜지지 않았다. 그런데 출력만 보고
+    확인할 수 있는 규칙이므로 — 코드로 강제할 수 있다. (섹션 8)
+    """
+    sents = [s.strip() for s in SENT_END.split(text) if s.strip()]
+    return bool(sents) and all(s.endswith(POLITE) for s in sents)
 
 
 def extract_body(url: str) -> str:
@@ -405,21 +659,42 @@ def draft(item: dict, body: str, note: str = "") -> Draft:
 def report(s: WorkerState) -> dict:
     """워커는 전체 상황을 모른다 — 자기가 맡은 기사만 안다."""
     it = s["item"]
-    body = extract_body(it["url"])
+    # 공공 API 항목처럼 상세페이지 추출이 안 되는 자료는 대체 본문을 쓴다
+    body = extract_body(it["url"]) or it.get("body_hint", "")
     if len(body) < SET.min_body:
         # 빠진 사실이 로그에 남는다. 모자란다고 다시 긁어 오지 않는다.
         return {"drafted": [], "log": [f"   − {it['title'][:40]} — 본문 부족({len(body)}자)"]}
 
+    # 지시가 지켜졌는지 출력만 보고 확인할 수 있으면, 부탁으로 두지 않고 코드로 센다 (섹션 8)
     d = draft(it, body)
     tries = 1
-    # 지시가 지켜졌는지 출력만 보고 확인할 수 있으면, 코드로 강제한다 (섹션 8)
-    while not HANGUL.search(d.summary) and tries < 2:
-        d = draft(it, body, "반드시 한국어로 쓰세요. 원문이 영어여도 출력은 한국어여야 합니다.")
+    while tries < 3:
+        notes = []
+        if not HANGUL.search(d.summary):
+            notes.append("반드시 한국어로 쓰세요. 원문이 영어여도 출력은 한국어여야 합니다.")
+        if not (is_polite(d.summary) and is_polite(d.why)):
+            notes.append("summary 와 why 의 모든 문장을 '~합니다'체로 끝내세요. "
+                         "'~했다 / ~이다 / ~한다' 같은 평서체는 안 됩니다.")
+        if not notes:
+            break
+        d = draft(it, body, "\n".join(notes))
         tries += 1
 
+    # 재요청하고도 못 고친 건 로그에 남긴다 — 안 남기면 그대로 발행되고 아무도 모른다
+    still = []
+    if not HANGUL.search(d.summary):
+        still.append("한국어 아님")
+    if not (is_polite(d.summary) and is_polite(d.why)):
+        still.append("문체 불일치")
+
     rec = {**it, "headline": d.headline, "summary": d.summary,
-           "why": d.why, "topic": d.topic, "body": body, "retries": tries - 1}
-    log = [f"   · {d.headline[:40]} (재요청 {tries - 1}회)"] if tries > 1 else []
+           "why": d.why, "topic": d.topic, "body": body,
+           "retries": tries - 1, "style_ok": not still}
+
+    log = []
+    if tries > 1:
+        log.append(f"   · {d.headline[:36]} — 재요청 {tries - 1}회"
+                   + (f", 미해결({'·'.join(still)})" if still else ", 해결"))
     return {"drafted": [rec], "log": log}
 
 
@@ -441,6 +716,10 @@ class Verdict(BaseModel):
 
 def check(d: dict) -> Verdict:
     """판정은 생성과 분리된 호출이어야 한다 — 쓴 사람에게 물으면 맞다고 답한다."""
+    # 이 세 줄을 '개선'하려다 오탐이 0/3 → 3/3 으로 늘었다. 같은 초안 위에서
+    # 세 가지 프롬프트를 비교해 확인한 결과이고, 고치려면 그때도 비교해야 한다.
+    #   · 불합격 사유를 길게 나열했더니 모델이 '누락'과 '표현 차이'로 떨어뜨렸다
+    #   · 근거 구절을 인용하게 했더니 요약에 없는 문장을 지어내 인용했다 (섹션 9의 ④)
     sys = (
         "당신은 교열 담당입니다. 요약의 각 주장이 원문에서 뒷받침되는지 판정하세요.\n"
         "번역과 단위 환산은 환각이 아닙니다 (three months→3개월, $60 million→6000만 달러).\n"
@@ -502,7 +781,7 @@ def make_lead(n: int) -> dict:
         return {"title": f"{today} 브리핑",
                 "description": "오늘은 조용합니다.",
                 "color": 0x6B7280}
-    return {"title": f"{today} 브리핑", "description": f"오늘 고른 {n}건입니다.", "color": 0x0B6E77}
+    return {"title": f"{today} 브리핑", "description": f"오늘 고른 소식 {n}건", "color": 0x0B6E77}
 
 
 def build_embeds(items: list[dict]) -> list[dict]:
@@ -530,7 +809,7 @@ def send(embeds: list[dict], dry_run: bool) -> str:
     url = os.environ.get("DISCORD_WEBHOOK_URL", "")
     if not url:
         return "웹훅 주소 없음 — 보내지 않음"
-    r = requests.post(url, json={"username": "편집실", "embeds": embeds}, timeout=15)
+    r = requests.post(url, json={"username": "모두의 교양", "embeds": embeds}, timeout=15)
     return str(r.status_code)          # 성공은 204 (본문 없음)
 
 
@@ -541,6 +820,8 @@ def publish(s: dict) -> dict:
             for d in items]
     dry = os.environ.get("DRY_RUN", "1") != "0"      # 기본값은 '보내지 않음'
     code = send(build_embeds(slim), dry)
+    if not dry and code[:1] == "2" and items:        # 2xx 로 실제로 나간 것만
+        record_published(items)
     return {"log": [f"⑤ 발행   {len(slim)}건 → {code}"]}
 
 
@@ -580,17 +861,28 @@ def run(hours: int | None = None) -> dict:
     out = build().compile().invoke(init)
 
     by_source: dict[str, int] = {}
+    by_group: dict[str, int] = {}
     for d in out.get("verified", []):
         by_source[d["source"]] = by_source.get(d["source"], 0) + 1
+        g = d.get("group") or "미분류"
+        by_group[g] = by_group.get(g, 0) + 1
 
     row = {
         "run_id":      datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        # 그 실행에서 쓴 설정 — 나중에 '언제 무엇을 바꿨는지' 되짚을 수 있게 (섹션 12)
         "hours":       init["hours"],
+        "per_source_max": SET.per_source_max,
+        "batch":       SET.batch,
         "collected":   len(out.get("collected", [])),      # ─┐
         "picked":      len(out.get("picked", [])),         #  │ 깔때기
         "drafted":     len(out.get("drafted", [])),        #  │
         "published":   len(out.get("verified", [])),       # ─┘
         "by_source":   by_source,
+        "by_group":    by_group,        # 쿼터가 실제로 채워졌는지 (계획 §7)
+        # 부탁이 몇 번 중 몇 번 지켜지는지 — '프롬프트만으로 될까'에 대한 답 (섹션 8)
+        "style_retry": sum(1 for d in out.get("drafted", []) if d.get("retries", 0)),
+        "style_unfixed": sum(1 for d in out.get("drafted", []) if not d.get("style_ok", True)),
+        "verify_fail": len(out.get("drafted", [])) - len(out.get("verified", [])),
         "elapsed_sec": round(time.time() - started, 1),
         "log":         out.get("log", []),
     }

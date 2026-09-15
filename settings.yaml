@@ -1,32 +1,89 @@
 # settings.yaml — 개발자가 고치는 임계값과 소스 목록.
-# audience.yaml 과 나눈 이유: 바뀌는 값이긴 하지만 고치는 사람이 다르다. (섹션 13)
+# 예전 AI 뉴스 설정은 settings.ai-news.yaml 에 남겨 두었다.
 
-hours:          24     # 수집 시간 창
-batch:          40     # 예선 묶음 크기 — 모델이 흘리지 않고 볼 수 있는 크기
-prelim_keep:     8     # 묶음당 예선 통과 수 — '묶음 운'을 줄이려고 넉넉히
-target:          5     # 최종 발행 목표
-tier1_max:       2     # 1차 소스 경쟁 면제의 상한 — 면제만으로 자리가 다 차면 안 된다
-per_source_max:  8     # 한 매체가 후보를 독차지하지 못하게
-min_body:      600     # G1 본문 관문 기준선(자)
+hours:         168     # 7일. 문화 기사는 하루 물량이 적어 창을 넓힌다.
+                       # 매일 이 7일을 다시 훑으므로, 이미 발행한 것을 빼는
+                       # 실행 간 중복 차단(store/published.jsonl)이 반드시 함께 있어야 한다.
+batch:          40
+prelim_keep:     8
+target:          5
+tier1_max:       0     # 이 분야에서 1차 소스(플랫폼·미술관 공식)는 곧 홍보물이다.
+                       # 4강의 "면제는 경쟁 면제이지 검사 면제가 아니다" 가 강하게 적용된다.
+per_source_max:  6     # 7일 창이라 한 소스가 쉽게 독차지한다. 24h 때보다 낮춘다
+min_body:      500     # ArchDaily 가 604자. 600 이면 아슬아슬해 낮춘다
 model: "gpt-4o-mini"
 
-# tier 1 = 당사자 발표(경쟁 면제), 2 = 매체
-# kind rss = 사다리 2칸 / hn = 1칸(공개 API)
+# 문화 3 + 공간 2. audience.yaml 토픽의 '묶음' 이름과 맞아야 한다.
+quota:
+  문화: 3
+  공간: 2
+
+filters:
+  # 경향 문화면은 연예·가요가 절반이라 선필터가 필수다.
+  pick:
+    - 영화
+    - 드라마
+    - 시리즈
+    - OTT
+    - 넷플릭스
+    - 디즈니
+    - 왓챠
+    - 티빙
+    - 쿠팡플레이
+    - 애플TV
+    - 다큐
+    - 개봉
+    - 상영
+    - 독립영화
+    - 책
+    - 도서
+    - 소설
+    - 출판
+    - 작가
+    - 에세이
+    - 전시
+    - 미술관
+    - 박물관
+    - 갤러리
+    - 비엔날레
+    - 건축
+    - 설치미술
+
 sources:
-  - {name: "OpenAI 블로그",    url: "https://openai.com/blog/rss.xml",            tier: 1}
-  - {name: "DeepMind",        url: "https://deepmind.google/blog/rss.xml",       tier: 1}
-  - {name: "Hugging Face",    url: "https://huggingface.co/blog/feed.xml",       tier: 1}
-  # Anthropic 블로그은 공개 RSS 가 없다(404) — 사다리 1·2칸이 비어 있는 소스의 실례.
-  # 5칸(스크래핑)까지 내려갈 가치가 있는지는 별도 판단이다. 지금은 목록에서 뺀다.
-  - {name: "Google AI",       url: "https://blog.google/technology/ai/rss/",     tier: 1}
-  - {name: "TechCrunch AI",   url: "https://techcrunch.com/category/artificial-intelligence/feed/"}
-  - {name: "The Verge AI",    url: "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml"}
-  # VentureBeat 는 자동 수집에 429(요청 한도)를 돌려준다 — G3(접근) 관문 탈락.
-  - {name: "Ars Technica AI", url: "https://arstechnica.com/ai/feed/"}
-  - {name: "MIT Tech Review", url: "https://www.technologyreview.com/topic/artificial-intelligence/feed"}
-  - {name: "AI타임스",         url: "https://www.aitimes.com/rss/allArticle.xml"}
-  - {name: "전자신문 IT",      url: "https://rss.etnews.com/Section902.xml"}
-  - {name: "ZDNet Korea",     url: "https://feeds.feedburner.com/zdkorea"}
-  - name: "Hacker News"
-    url:  "https://hn.algolia.com/api/v1/search_by_date?tags=story&query=AI&hitsPerPage=50"
-    kind: "hn"
+  # ── 문화 (OTT·영화·책) ───────────────────────────────
+  - {name: "WhatsOnNetflix", url: "https://www.whats-on-netflix.com/feed/"}
+  - {name: "Decider",        url: "https://decider.com/feed/"}
+  - {name: "IndieWire",      url: "https://www.indiewire.com/feed/"}
+  - {name: "Guardian Books", url: "https://www.theguardian.com/books/rss"}
+  - {name: "LitHub",         url: "https://lithub.com/feed/"}
+
+  # ── 공간 (건축·전시·디자인) ───────────────────────────
+  - {name: "ArchDaily",      url: "https://www.archdaily.com/rss/"}
+  - {name: "Designboom",     url: "https://www.designboom.com/feed/"}
+  - {name: "Colossal",       url: "https://www.thisiscolossal.com/feed/"}
+  - {name: "Guardian Art",   url: "https://www.theguardian.com/artanddesign/rss"}
+  - {name: "월간디자인",       url: "https://mdesign.designhouse.co.kr/rss"}
+
+  # ── 국내 종합 — 연예 노이즈가 많아 선필터를 건다 ────────
+  - {name: "경향 문화",       url: "https://www.khan.co.kr/rss/rssdata/culture_news.xml", match: "pick"}
+
+  # ── 사다리 1칸: 국내 전시 정보는 RSS 가 없어 공공 API 로 올라간다 ──
+  # 키 발급: data.go.kr → "한국문화정보원 공연전시정보" 활용 신청 → KCISA_SERVICE_KEY
+  - name: "문화포털 전시"
+    url:  "https://apis.data.go.kr/B553457/cultureinfo"   # period2 · detail2 를 부른다
+    kind: "kcisa"
+
+# ── 관문에서 탈락한 소스 — 다시 넣지 않도록 이유를 남긴다 (12강) ──
+# Dezeen          : 7일 50건으로 물량 1위였으나 본문 추출 0자 (G1)
+# RogerEbert      : 본문 추출 0자 (G1)
+# NYT Books       : 본문 추출 0자 (G1)
+# Criterion       : 본문 추출 0자 + 7일 내 1건 (G1·G2)
+# 월간미술         : 본문 452자 (G1)
+# 한겨레 문화면     : 30건인데 7일 내 0건, 날짜 표기 이상 (G2)
+# 브리크 매거진     : 7일 내 0건, 발행이 뜸함 (G2)
+# 씨네21 · 네오룩 · MMCA · 아트맵 · VMSPACE · KOPIS · 채널예스 · 넷플릭스 뉴스룸
+#                 : 404 또는 entries 0 — 사다리 1·2칸이 비어 있음 (3강)
+# culture.go.kr 구 openapi        : HTML 에러페이지, 폐기됨 (진짜 키로도 동일)
+# api.kcisa.kr API_CCA_1xx        : data.go.kr 키를 받지 않음 (전부 403)
+# 한국문화정보원_전시회정보(odcloud) : 2024년 전시 36건짜리 정지된 스냅샷.
+#                                   진행 중 0건 · 링크 없음 · 장소 없음 (G1·G2 탈락)
