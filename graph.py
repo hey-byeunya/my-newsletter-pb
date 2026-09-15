@@ -155,6 +155,26 @@ SYS = build_sys(CFG)
 GROUPS = topic_groups(CFG)          # 묶음 → 토픽 이름들
 QUOTA = SET.quota                   # 묶음 → 최소 보장 건수
 
+# 토픽 이름 → 묶음. audience.yaml 이 이미 정해 둔 관계라 코드로 계산할 수 있다.
+# 모델에게 묶음을 물어볼 필요가 없는 값이다 (아래 group_of 참고).
+TOPIC_GROUP = {name: g for g, names in GROUPS.items() for name in names}
+
+
+def group_of(d: dict) -> str:
+    """묶음을 '계산' 한다. 모델이 준 라벨은 마지막 수단으로만 쓴다.
+
+    선별 단계에서 모델이 붙인 group 은 확인할 방법이 없어 실제로 틀렸다 —
+    전시 기사 다섯 건이 모두 '문화' 로 들어와 공간 쿼터가 0건이 됐다.
+    반면 topic 은 audience.yaml 의 토픽 이름으로 못박혀 있고, 토픽이 어느
+    묶음에 속하는지는 설정에 이미 적혀 있다. 확인할 수 있는 값에서 끌어낸다.
+    """
+    t = (d.get("topic") or "").strip()
+    if t in TOPIC_GROUP:
+        return TOPIC_GROUP[t]
+    g = (d.get("group") or "").strip()        # 취재 전 단계(로그·집계)에서는 이것뿐이다
+    return g if g in QUOTA else "미분류"
+
+
 # 선별은 여유분까지 뽑고, 발행 직전에 target 으로 줄인다. 검수가 사이에서 건수를 깎기 때문이다.
 OVERSELECT = max(SET.overselect, SET.target)
 MAX_PER_SOURCE = SET.max_per_source or 10**9      # 0 = 제한 없음
@@ -656,10 +676,13 @@ def select(s: dict) -> dict:
     if QUOTA:
         got: dict[str, int] = {}
         for r in picked:
-            got[r.get("group") or "미분류"] = got.get(r.get("group") or "미분류", 0) + 1
+            got[group_of(r)] = got.get(group_of(r), 0) + 1
         want = " · ".join(f"{g} {got.get(g, 0)}/{q}" for g, q in QUOTA.items())
         extra = got.get("미분류", 0)
-        log.insert(1, f"   쿼터: {want}" + (f" · 미분류 {extra}" if extra else ""))
+        # 이 단계의 묶음은 아직 모델이 준 라벨이다 — 취재에서 토픽이 정해지면
+        # 발행 직전에 계산된 값으로 다시 센다. 두 숫자가 다른 것이 정상이다.
+        log.insert(1, f"   쿼터(모델 라벨): {want}"
+                      + (f" · 미분류 {extra}" if extra else ""))
     # 탈락 사유가 없으면 선별이 잘못됐을 때 무엇을 고칠지 알 수 없다
     for d in drops + final.drops:
         log.append(f"   − {d}")
@@ -675,7 +698,10 @@ class Draft(BaseModel):
     headline: str = Field(description="한국어 헤드라인. 40자 이내")
     summary:  str = Field(description="한국어 세 문장 요약. '~합니다'체. 원문에 있는 내용만")
     why:      str = Field(description="이 독자에게 왜 중요한지 한 문장. 요약에 있는 내용만 근거로")
-    topic:    str = Field(description="아래 토픽 이름 중 하나를 그대로")
+    # enum 이 없으면 '전시·공간' 대신 '전시' 가 돌아온다. 실제로 그랬고,
+    # _color() 가 조용히 기본색으로 떨어졌다. 스키마로 못박는다.
+    topic:    str = Field(description=f"반드시 다음 중 하나: {' | '.join(TOPIC_GROUP)}",
+                          json_schema_extra={"enum": list(TOPIC_GROUP)})
 
 
 HANGUL = re.compile(r"[가-힣]")
@@ -887,7 +913,7 @@ def pick_for_publish(verified: list[dict]) -> tuple[list[dict], list[str]]:
         for i, d in enumerate(verified):
             if i in taken or len(out) >= SET.target:
                 continue
-            g = d.get("group") or "미분류"
+            g = group_of(d)                          # 모델 라벨이 아니라 토픽에서 계산한다
             if quota_phase and per_grp.get(g, 0) >= QUOTA.get(g, 0):
                 continue                             # 쿼터 단계에서는 넘치는 묶음을 미룬다
             if per_src.get(d["source"], 0) >= MAX_PER_SOURCE:
@@ -922,7 +948,7 @@ def publish(s: dict) -> dict:
         got: dict[str, int] = {}
         src: dict[str, int] = {}
         for d in items:
-            g = d.get("group") or "미분류"
+            g = group_of(d)
             got[g] = got.get(g, 0) + 1
             src[d["source"]] = src.get(d["source"], 0) + 1
         if QUOTA:
@@ -997,8 +1023,7 @@ def run(hours: int | None = None) -> dict:
     by_group: dict[str, int] = {}
     for d in published_items:
         by_source[d["source"]] = by_source.get(d["source"], 0) + 1
-        g = d.get("group") or "미분류"
-        by_group[g] = by_group.get(g, 0) + 1
+        by_group[group_of(d)] = by_group.get(group_of(d), 0) + 1
 
     row = {
         "run_id":      datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
