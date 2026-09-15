@@ -82,7 +82,10 @@ class Source(BaseModel):
     tier: int = 2           # 1 = 당사자 발표(경쟁 면제), 2 = 매체 (섹션 4)
     match: str | None = None  # filters 의 이름. 종합 피드를 주제로 좁힐 때 쓴다
     tz_offset: float | None = None  # pubDate 에 타임존이 없고 현지 시각으로 적는 발행자용
-    local_only: bool = False        # 해외 리전에서 닿지 않는 소스. CI 에서는 건너뛴다
+    local_only: bool = False        # 해외 리전에서 닿지 않는 소스. CI 에서는 캐시를 쓴다
+    # 이 소스만 다른 후보 상한을 쓴다. 없으면 per_source_max.
+    # 목록형 소스(행사 DB)가 후보를 많이 차지하면 비평 기사가 본선에 못 올라온다.
+    max_items: int | None = None
 
 
 class Settings(BaseModel):
@@ -323,6 +326,58 @@ def fetch_rss(src: Source) -> list[dict]:
     return out
 
 
+# ── 닿지 않는 곳에서 쓰는 캐시 (섹션 5) ──────────────────
+# local_only 소스는 CI 에서 부를 수 없다. 국내에서 성공한 결과를 저장해 두고
+# CI 는 그것을 읽는다. 전시는 몇 주씩 열리므로 하루 이틀 지난 목록도 쓸 만하다.
+#
+# 항목의 at 은 '받은 시각' 그대로 둔다 — 새로 받은 척하지 않는다. 그래서
+# 캐시가 시간 창(hours)보다 오래되면 수집 단계에서 저절로 전부 탈락한다.
+# 유효기간을 따로 두지 않아도 스스로 만료된다.
+SOURCE_CACHE = ROOT / "store" / "source_cache.json"
+
+
+def _cache_load() -> dict:
+    if not SOURCE_CACHE.exists():
+        return {}
+    try:
+        return json.loads(SOURCE_CACHE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}                                    # 깨진 캐시는 없는 것으로 친다
+
+
+def cache_save(name: str, items: list[dict]) -> None:
+    """국내에서 성공했을 때만 부른다. datetime 은 문자열로 눕힌다."""
+    if not items:
+        return                                       # 빈 결과로 멀쩡한 캐시를 덮지 않는다
+    data = _cache_load()
+    data[name] = {
+        "at": datetime.now(timezone.utc).isoformat(),
+        "items": [{**it, "at": it["at"].isoformat() if it.get("at") else None}
+                  for it in items],
+    }
+    SOURCE_CACHE.parent.mkdir(exist_ok=True)
+    SOURCE_CACHE.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                            encoding="utf-8")
+
+
+def cache_read(name: str) -> tuple[list[dict], float | None]:
+    """(항목, 며칠 전에 받았나). 캐시가 없으면 ([], None)."""
+    row = _cache_load().get(name)
+    if not row:
+        return [], None
+    try:
+        saved = datetime.fromisoformat(row["at"])
+    except Exception:
+        return [], None
+    age = (datetime.now(timezone.utc) - saved).total_seconds() / 86400
+    out = []
+    for it in row.get("items", []):
+        d = dict(it)
+        d["at"] = datetime.fromisoformat(it["at"]) if it.get("at") else None
+        out.append(d)
+    return out, age
+
+
 PUBLISHED = ROOT / "store" / "published.jsonl"
 PUBLISHED_KEEP_DAYS = 90
 
@@ -459,6 +514,7 @@ def fetch_kcisa(src: Source) -> list[dict]:
             # 상세페이지 추출이 실패할 때 쓸 대체 본문
             "body_hint": f"{title}\n{info}\n주소: {g('placeAddr')}\n\n{g('contents1')}",
         })
+    cache_save(src.name, out)        # CI 가 읽을 수 있게 남긴다 (섹션 5)
     return out
 
 
@@ -469,25 +525,16 @@ def collect(s: dict) -> dict:
     total, dup, off, seen_before = 0, 0, 0, 0
     off_by: dict[str, int] = {}
     skipped: list[str] = []
+    from_cache: list[str] = []
     already = published_urls()
     fresh: list[dict] = []
     dead: list[str] = []
     seen: set[str] = set()
 
-    for src in SOURCES:
-        if src.local_only and IS_CI:
-            # 건너뛴 것도 반드시 남긴다. 조용히 빠지면 며칠 뒤 아무도 모른다.
-            skipped.append(src.name)
-            continue
-        try:
-            raw = ({"kcisa": fetch_kcisa}.get(src.kind, fetch_rss))(src)
-        except Exception as exc:
-            # 타입 이름만 남기면 'RuntimeError' 한 단어뿐이라 고칠 수가 없다.
-            # 사유까지 실어야 로그가 진단이 된다.
-            reason = str(exc).strip() or type(exc).__name__
-            dead.append(f"{src.name}: {reason[:130]}")        # 한 곳이 죽어도 나머지는 모인다
-            continue
-        total += len(raw)
+    def ingest(raw: list[dict], src: Source) -> None:
+        """항목을 창·주제·중복으로 거른다. 새로 받은 것과 캐시가 같은 길을 지나야
+        캐시 때문에 기준이 느슨해지는 일이 없다."""
+        nonlocal dup, off, seen_before
         pat = FILTERS.get(src.match) if src.match else None
         for it in raw:
             at = it["at"]
@@ -507,12 +554,38 @@ def collect(s: dict) -> dict:
             seen.add(key)
             fresh.append(it)
 
+    for src in SOURCES:
+        if src.local_only and IS_CI:
+            # 부를 수는 없지만 국내에서 받아 둔 것이 있으면 그것을 쓴다.
+            cached, age = cache_read(src.name)
+            if cached:
+                total += len(cached)
+                from_cache.append(f"{src.name} {age:.1f}일 전 {len(cached)}건")
+                ingest(cached, src)
+            else:
+                # 건너뛴 것도 반드시 남긴다. 조용히 빠지면 며칠 뒤 아무도 모른다.
+                skipped.append(src.name)
+            continue
+        try:
+            raw = ({"kcisa": fetch_kcisa}.get(src.kind, fetch_rss))(src)
+        except Exception as exc:
+            # 타입 이름만 남기면 'RuntimeError' 한 단어뿐이라 고칠 수가 없다.
+            # 사유까지 실어야 로그가 진단이 된다.
+            reason = str(exc).strip() or type(exc).__name__
+            dead.append(f"{src.name}: {reason[:130]}")        # 한 곳이 죽어도 나머지는 모인다
+            continue
+        total += len(raw)
+        ingest(raw, src)
+
     # 소스별 상한 — 실제로 중복 제거보다 더 많이 걸러낸다 (섹션 7)
+    # 목록형 소스는 max_items 로 더 낮춘다. 상한이 없으면 행사 DB 가 후보를
+    # 채워 비평 기사가 본선에 못 올라온다.
     fresh.sort(key=lambda x: x["at"], reverse=True)
     per: dict[str, int] = {}
+    caps = {src.name: (src.max_items or SET.per_source_max) for src in SOURCES}
     kept, capped = [], 0
     for it in fresh:
-        if per.get(it["source"], 0) >= SET.per_source_max:
+        if per.get(it["source"], 0) >= caps.get(it["source"], SET.per_source_max):
             capped += 1
             continue
         per[it["source"]] = per.get(it["source"], 0) + 1
@@ -523,8 +596,11 @@ def collect(s: dict) -> dict:
            f"→ 상한 -{capped} → 후보 {len(kept)}건"]
     if off_by:
         log.append("   · 선필터: " + ", ".join(f"{k} -{v}" for k, v in off_by.items()))
+    if from_cache:
+        # 캐시를 썼다는 사실과 나이를 반드시 남긴다 — 신선한 척하지 않는다
+        log.append(f"   · 캐시 사용: {', '.join(from_cache)}")
     if skipped:
-        log.append(f"   · 건너뜀(로컬 전용): {', '.join(skipped)}")
+        log.append(f"   · 건너뜀(캐시 없음): {', '.join(skipped)}")
     if dead:
         # 이 한 줄이 없으면 소스가 조용히 빠진 채 매일 '성공'한다. (섹션 5)
         log.append(f"   · 응답 없음: {', '.join(dead)}")
