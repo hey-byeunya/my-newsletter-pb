@@ -368,8 +368,21 @@ def _kcisa_get(path: str, key: str, **params) -> ET.Element:
     대신 '길이와 모양'만 남긴다 — Encoding 키(%2B·%2F 포함)를 넣으면
     requests 가 한 번 더 인코딩해 깨지는 것이 흔한 원인이라서다.
     """
-    r = requests.get(f"{KCISA_BASE}/{path}", timeout=25, headers=UA,
-                     params={"serviceKey": key, **params})
+    shape0 = f"키 {len(key)}자/{'인코딩형' if '%' in key else '일반형'}"
+    last = None
+    for attempt in (1, 2, 3):
+        t0 = time.time()
+        try:
+            # (연결, 응답) 타임아웃을 나눈다. 국내 공공 API 는 해외 리전에서
+            # 느리거나 아예 닿지 않는 일이 있어, 어느 쪽에서 막혔는지 구분해야 한다.
+            r = requests.get(f"{KCISA_BASE}/{path}", timeout=(10, 50), headers=UA,
+                             params={"serviceKey": key, **params})
+            break
+        except requests.RequestException as exc:
+            last = f"{type(exc).__name__} {time.time() - t0:.1f}s (시도 {attempt}/3)"
+            time.sleep(2 * attempt)
+    else:
+        raise RuntimeError(f"{path} 연결 실패 · {last} · {shape0}")
     body = r.text or ""
     m = re.search(r"<(?:returnAuthMsg|errMsg|resultMsg)>(.*?)</(?:returnAuthMsg|errMsg|resultMsg)>", body)
     reason = (m.group(1) if m else "").strip()
