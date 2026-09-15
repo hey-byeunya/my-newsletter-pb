@@ -476,12 +476,12 @@ C 의 출력은 이렇습니다.
 flowchart TD
     START([START]) --> collect
 
-    collect["① collect — 수집<br/>12소스 · 시간창 168h<br/>주제밖 · 기발행 · 중복 · 상한 제거"]
-    select["② select — 선별<br/>예선 batch 40 → keep 8<br/>본선 → overselect 8<br/>event 중복 제거 · 쿼터 잠정"]
+    collect["① collect — 수집<br/>17소스 · 시간창 168h<br/>주제밖 · 기발행 · 중복 · 상한 제거<br/>닿지 않는 소스는 캐시"]
+    select["② select — 선별<br/>예선 batch 40 → keep 8<br/>본선 → overselect 8<br/>같은 사건 묶기 · 쿼터 잠정"]
     report["③ report — 취재 (워커)<br/>본문 추출 → 초안<br/>한국어 · 문체 코드 검사 후 재요청"]
     verify["④ verify — 검수<br/>headline · summary 만 원문 대조<br/>생성과 분리된 호출"]
     publish["⑤ publish — 발행<br/>pick_for_publish → 최종 5건<br/>쿼터 · 매체 상한 재적용"]
-    store[("store/<br/>metrics.jsonl<br/>published.jsonl")]
+    store[("store/<br/>metrics.jsonl · published.jsonl<br/>source_cache.json")]
     discord{{"Discord Webhook<br/>embed 1 + 5"}}
 
     collect --> select
