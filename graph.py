@@ -1170,6 +1170,8 @@ INIT = {"hours": SET.hours, "collected": [], "picked": [],
 # ─────────────────────────────────────────────────────────────
 # 섹션 12 — 실행마다 한 줄 남기기
 # ─────────────────────────────────────────────────────────────
+GRAPH_STEP_LIMIT = 10     # 그래프 단계 상한. 순환이 없어 닿지 않지만 걸어 둔다
+
 METRICS = ROOT / "store" / "metrics.jsonl"
 
 # 자동 실행에는 화면을 보는 사람이 없다. 비밀값은 가려지는 것이 설계라(섹션 11),
@@ -1190,7 +1192,7 @@ def key_shape(name: str) -> str:
 
 def run(hours: int | None = None) -> dict:
     init = dict(INIT)
-    if hours:
+    if hours is not None:          # 0 은 falsy 다 — `if hours` 로 두면 조용히 무시된다
         init["hours"] = hours
 
     # 첫 줄에 찍는다 — 키를 잘못 넣었으면 돈을 쓰기 전에 보인다
@@ -1198,7 +1200,12 @@ def run(hours: int | None = None) -> dict:
     print(keys)
 
     started = time.time()
-    out = build().compile().invoke(init)
+    # 이 그래프에는 순환이 없다(collect→select→report→verify→publish→END).
+    # 그래서 한계에 닿을 일이 없지만, 값을 적어 두는 것 자체가 장치다 —
+    # 나중에 되돌아가는 엣지를 넣는 순간 무한 루프 대신 예외로 멈춘다.
+    # LangGraph 는 노드가 아니라 단계(super-step)를 센다. 취재 팬아웃은
+    # 몇 건이든 한 단계이므로 5단계면 충분하고, 여유를 두어 10으로 잡는다.
+    out = build().compile().invoke(init, config={"recursion_limit": GRAPH_STEP_LIMIT})
 
     # 집계는 '검수 합격분' 이 아니라 '실제 나간 것' 을 센다.
     # 이 둘이 다르다는 사실 자체가 후처리를 넣은 이유다.

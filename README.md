@@ -29,6 +29,7 @@
 | `source_audit.py` | 소스별 실측 — 접근·물량·본문 추출 (LLM 안 씀) | — |
 | `report_card.py` | 쌓인 기록으로 소스 성적표 | — |
 | `experiments/` | 프롬프트·스키마를 고치기 전에 재는 자리 | 개발자 |
+| `CLAUDE.md` | 이 저장소의 원칙 · 사람과 AI 의 역할 분담 | 개발자 |
 | `.github/workflows/daily.yml` | 매일 아침 자동 실행 | 개발자 |
 | `store/metrics.jsonl` | 실행마다 한 줄씩 쌓이는 기록 | (자동) |
 | `store/source_cache.json` | 닿지 않는 곳에서 쓰려고 남겨 둔 수집 결과 | (자동) |
@@ -53,6 +54,19 @@ cp .env.example .env        # OPENAI_API_KEY 와 DISCORD_WEBHOOK_URL 채우기
 ```
 
 `DRY_RUN` 기본값은 `1`(보내지 않음)입니다. 실수로 발행되는 쪽보다 실수로 안 보내는 쪽이 덜 나쁩니다.
+
+### 키 없이 확인하기
+
+위 명령은 `OPENAI_API_KEY` 가 있어야 돕니다. 키 없이 볼 수 있는 것은 이렇습니다.
+
+```bash
+./.venv/bin/python experiments/exp_dup.py --detector-only   # 중복 검출기를 210쌍 전부에 (LLM 안 씀)
+./.venv/bin/python report_card.py                            # 쌓인 실행 기록으로 소스 성적표
+tail -1 store/metrics.jsonl                                  # 마지막 회차의 전 구간 로그
+```
+
+첫 줄은 같은 사건 판정의 임계값을 어떻게 정했는지를 **비용 0으로 즉시 재현**합니다
+— 정답 2쌍만 검출, 오검출 0 (`REPORT.md` 3-7절).
 
 ## 자동 실행
 
