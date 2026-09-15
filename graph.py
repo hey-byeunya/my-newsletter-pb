@@ -478,7 +478,10 @@ def collect(s: dict) -> dict:
             raw = ({"hn": fetch_hn, "kcisa": fetch_kcisa}
                    .get(src.kind, fetch_rss))(src)
         except Exception as exc:
-            dead.append(f"{src.name}({type(exc).__name__})")   # 한 곳이 죽어도 나머지는 모인다
+            # 타입 이름만 남기면 'RuntimeError' 한 단어뿐이라 고칠 수가 없다.
+            # 사유까지 실어야 로그가 진단이 된다.
+            reason = str(exc).strip() or type(exc).__name__
+            dead.append(f"{src.name}: {reason[:130]}")        # 한 곳이 죽어도 나머지는 모인다
             continue
         total += len(raw)
         pat = FILTERS.get(src.match) if src.match else None
