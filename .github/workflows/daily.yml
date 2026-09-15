@@ -2,7 +2,7 @@ name: 오늘의 볼거리 브리핑
 
 on:
   schedule:
-    - cron: "30 22 * * *"        # ① UTC 22:30 = KST 07:30 (전날 날짜가 된다)
+    - cron: "50 0 * * *"         # ① UTC 00:50 = KST 09:50 (같은 날짜)
   workflow_dispatch:             # ② 손으로도 돌릴 수 있게 — 없으면 고칠 수 없다
     inputs:
       dry_run:
