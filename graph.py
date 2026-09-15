@@ -276,9 +276,12 @@ def published_at(e) -> datetime | None:
 def _shift(at: datetime | None, offset: float | None) -> datetime | None:
     """타임존 없이 현지 시각으로 pubDate 를 적는 발행자를 보정한다.
 
-    feedparser 는 타임존이 없는 시각을 UTC 로 읽는다. AI타임스는 KST 를
-    '2026-09-14 14:32:15' 처럼 적어서, 보정하지 않으면 모든 기사가 9시간
+    feedparser 는 타임존이 없는 시각을 UTC 로 읽는다. 독서신문은 KST 를
+    '2026-09-15 11:53:33' 처럼 적어서, 보정하지 않으면 모든 기사가 9시간
     미래로 들어온다 — 시간 창을 늘 통과하고 정렬에서 늘 맨 위에 선다.
+
+    이 버그는 소스를 갈아도 따라온다. 국내 매체에서 흔한 표기라
+    새 소스를 넣을 때마다 '최신 항목이 미래인가' 를 봐야 한다.
     """
     if at is None or not offset:
         return at
@@ -670,7 +673,7 @@ def select(s: dict) -> dict:
     for i in range(0, len(rest), SET.batch):
         chunk = rest[i: i + SET.batch]
         res = ask_picks(chunk, SET.prelim_keep, "예선")
-        got = [dict(chunk[p.index], event=p.event, pick_why=p.why) for p in res.picks]
+        got = [chunk[p.index] for p in res.picks]
         shortlist += got
         log.append(f"   예선 묶음 {len(chunk)}건 → {len(got)}건")
     log.append(f"   예선 통과 {len(shortlist)}건 (tier1 자동통과 {len(tier1)}건 포함)")
@@ -692,8 +695,7 @@ def select(s: dict) -> dict:
         seen_events.add(ev)
         # 묶음은 모델이 준 토픽에서 계산한다. 취재가 끝나면 report() 가
         # 본문을 읽고 topic 을 다시 쓰므로, 이 값은 선별 단계용 잠정치다.
-        rec = dict(it, event=p.event, pick_why=p.why,
-                   topic=p.topic, group=TOPIC_GROUP.get(p.topic, "미분류"))
+        rec = dict(it, topic=p.topic, group=TOPIC_GROUP.get(p.topic, "미분류"))
 
         # 묶음별 최소 보장을 먼저 채운다. 넘치는 것은 남은 자리를 놓고 겨룬다.
         g = TOPIC_GROUP.get(p.topic)
