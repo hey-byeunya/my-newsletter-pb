@@ -695,7 +695,10 @@ def select(s: dict) -> dict:
         seen_events.add(ev)
         # 묶음은 모델이 준 토픽에서 계산한다. 취재가 끝나면 report() 가
         # 본문을 읽고 topic 을 다시 쓰므로, 이 값은 선별 단계용 잠정치다.
-        rec = dict(it, topic=p.topic, group=TOPIC_GROUP.get(p.topic, "미분류"))
+        # 채택 사유와 중복 판정 라벨을 함께 싣는다. 아래에서 로그로 꺼낸다 —
+        # 만들어 놓고 안 남기면 '기준이 동작했다' 를 증명할 근거가 사라진다.
+        rec = dict(it, topic=p.topic, group=TOPIC_GROUP.get(p.topic, "미분류"),
+                   pick_why=(p.why or "").strip(), event=(p.event or "").strip())
 
         # 묶음별 최소 보장을 먼저 채운다. 넘치는 것은 남은 자리를 놓고 겨룬다.
         g = TOPIC_GROUP.get(p.topic)
@@ -725,6 +728,14 @@ def select(s: dict) -> dict:
         # 발행 단계의 숫자와 다를 수 있다 — 다른 것이 정상이다.
         log.insert(1, f"   쿼터(잠정): {want}"
                       + (f" · 미분류 {extra}" if extra else ""))
+    # 채택 사유 — 탈락만 남기면 '왜 이게 됐나' 에 답할 수 없다.
+    # 토픽(쿼터가 쓰는 라벨)과 함께 남겨 기준이 무엇을 보고 골랐는지 보이게 한다.
+    for r in picked:
+        why = r.get("pick_why") or "사유 없음"
+        log.append(f"   ＋ {r['title'][:34]} [{r.get('topic', '?')}] — {why[:56]}")
+    # 중복 판정 라벨이 실제로 서로 달랐는지 — 같은 라벨이 몰리면 이 수가 준다
+    labels = {(r.get("event") or r["title"]).lower() for r in picked}
+    log.append(f"   라벨: 서로 다른 사건 {len(labels)}개 / 채택 {len(picked)}건")
     # 탈락 사유가 없으면 선별이 잘못됐을 때 무엇을 고칠지 알 수 없다
     for d in drops + final.drops:
         log.append(f"   − {d}")
