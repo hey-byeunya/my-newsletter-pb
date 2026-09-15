@@ -630,9 +630,21 @@ class Pick(BaseModel):
     why:   str = Field(description="고른 이유 한 줄")
 
 
+class Drop(BaseModel):
+    """탈락 사유를 문장이 아니라 칸으로 받는다.
+
+    설명에 '기사와 그 이유' 라고 적어 두면 모델은 제목만 돌려준다. 형식을
+    「제목」 — 이유 로 못박아 봐도 마찬가지였다(오히려 더 나빠졌다). 같은 입력
+    21건 위에서 6회씩 비교한 결과 — 현행 ≈0% · 설명 강화 3% · 이 스키마 100%.
+    부탁이 아니라 칸으로 강제해야 채워진다. (섹션 7)
+    """
+    index:  int = Field(description="떨어뜨린 기사의 번호")
+    reason: str = Field(description="떨어뜨린 이유. 어느 기준에 걸렸는지 한 줄로")
+
+
 class Shortlist(BaseModel):
     picks: list[Pick]
-    drops: list[str] = Field(default_factory=list, description="눈에 띄게 떨어뜨린 기사와 그 이유")
+    drops: list[Drop] = Field(default_factory=list, description="눈에 띄게 떨어뜨린 기사와 그 이유")
 
 
 def _numbered(items: list[dict]) -> str:
@@ -653,6 +665,7 @@ def ask_picks(items: list[dict], k: int, stage: str) -> Shortlist:
                   {"role": "user", "content": user}], Shortlist)
     # 모델이 범위를 벗어난 번호를 줄 수 있다 — 코드로 거른다
     out.picks = [p for p in out.picks if 0 <= p.index < len(items)][:k]
+    out.drops = [d for d in out.drops if 0 <= d.index < len(items)]
     return out
 
 
@@ -737,8 +750,10 @@ def select(s: dict) -> dict:
     labels = {(r.get("event") or r["title"]).lower() for r in picked}
     log.append(f"   라벨: 서로 다른 사건 {len(labels)}개 / 채택 {len(picked)}건")
     # 탈락 사유가 없으면 선별이 잘못됐을 때 무엇을 고칠지 알 수 없다
-    for d in drops + final.drops:
+    for d in drops:                                   # 코드가 떨어뜨린 것
         log.append(f"   − {d}")
+    for d in final.drops:                             # 데스크가 떨어뜨린 것
+        log.append(f"   − {shortlist[d.index]['title'][:34]} — {d.reason[:60]}")
     return {"picked": picked, "log": log}
 
 
