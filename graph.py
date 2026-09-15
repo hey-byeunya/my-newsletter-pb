@@ -148,7 +148,7 @@ def build_sys(cfg: Audience) -> str:
         f"당신은 {cfg.독자.get('누구', '')}을 위한 뉴스레터 기자입니다.\n"
         "모든 출력은 한국어 '~합니다'체로 씁니다.\n"
         "headline 과 summary 는 원문에 있는 내용만 옮깁니다. 원문에 없는 사실을 쓰지 마세요.\n"
-        "why 는 요약에 있는 내용만 근거로, 이 독자에게 왜 중요한지 한 문장으로 씁니다."
+        "why 는 요약에 있는 내용만 근거로, 이걸 알면 무엇이 달리 보이는지 한 문장으로 씁니다."
     )
 
 
@@ -661,7 +661,7 @@ class Draft(BaseModel):
        headline·summary → 원문과 대조 가능 / why → 대조 대상 없음(해석)."""
     headline: str = Field(description="한국어 헤드라인. 40자 이내")
     summary:  str = Field(description="한국어 세 문장 요약. '~합니다'체. 원문에 있는 내용만")
-    why:      str = Field(description="이 독자에게 왜 중요한지 한 문장. 요약에 있는 내용만 근거로")
+    why:      str = Field(description="이걸 알면 무엇이 달리 보이는지 한 문장. 요약에 있는 내용만 근거로")
     # enum 이 없으면 '전시·공간' 대신 '전시' 가 돌아온다. 실제로 그랬고,
     # _color() 가 조용히 기본색으로 떨어졌다. 스키마로 못박는다.
     topic:    str = Field(description=f"반드시 다음 중 하나: {' | '.join(TOPIC_GROUP)}",
