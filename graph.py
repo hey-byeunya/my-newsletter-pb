@@ -580,8 +580,12 @@ class Pick(BaseModel):
                                    "장르나 분야가 아니다. 같은 대상을 다룬 기사끼리만 같은 라벨을 쓸 것")
     # default 를 주면 구조화 출력에서 '선택 필드' 가 되어 모델이 통째로 생략한다.
     # 필수로 두고, 값도 enum 으로 못박는다 — 부탁이 아니라 스키마로 강제한다.
-    group: str = Field(description=f"주제 묶음. 반드시 다음 중 하나: {' | '.join(GROUPS)}",
-                       json_schema_extra={"enum": list(GROUPS)})
+    #
+    # 묶음('문화'/'공간')이 아니라 토픽을 묻는다. 묶음은 '독자가 어떻게 접하는가'
+    # 라는 추상적인 가름이라 실제로 전시 기사가 전부 '문화' 로 들어왔다.
+    # 토픽은 구체적이라 모델이 안정적으로 맞히고, 묶음은 설정에서 계산된다.
+    topic: str = Field(description=f"반드시 다음 중 하나: {' | '.join(TOPIC_GROUP)}",
+                       json_schema_extra={"enum": list(TOPIC_GROUP)})
     why:   str = Field(description="고른 이유 한 줄")
 
 
@@ -653,10 +657,13 @@ def select(s: dict) -> dict:
             drops.append(f"{it['title'][:40]} — 같은 사건 중복({ev})")
             continue
         seen_events.add(ev)
-        rec = dict(it, event=p.event, pick_why=p.why, group=p.group)
+        # 묶음은 모델이 준 토픽에서 계산한다. 취재가 끝나면 report() 가
+        # 본문을 읽고 topic 을 다시 쓰므로, 이 값은 선별 단계용 잠정치다.
+        rec = dict(it, event=p.event, pick_why=p.why,
+                   topic=p.topic, group=TOPIC_GROUP.get(p.topic, "미분류"))
 
         # 묶음별 최소 보장을 먼저 채운다. 넘치는 것은 남은 자리를 놓고 겨룬다.
-        g = p.group if p.group in QUOTA else None
+        g = TOPIC_GROUP.get(p.topic)
         if g and filled[g] < QUOTA[g] and len(picked) < OVERSELECT:
             filled[g] += 1
             picked.append(rec)
@@ -679,9 +686,9 @@ def select(s: dict) -> dict:
             got[group_of(r)] = got.get(group_of(r), 0) + 1
         want = " · ".join(f"{g} {got.get(g, 0)}/{q}" for g, q in QUOTA.items())
         extra = got.get("미분류", 0)
-        # 이 단계의 묶음은 아직 모델이 준 라벨이다 — 취재에서 토픽이 정해지면
-        # 발행 직전에 계산된 값으로 다시 센다. 두 숫자가 다른 것이 정상이다.
-        log.insert(1, f"   쿼터(모델 라벨): {want}"
+        # 제목만 보고 매긴 잠정 토픽이다. 취재가 본문을 읽고 토픽을 고쳐 쓰므로
+        # 발행 단계의 숫자와 다를 수 있다 — 다른 것이 정상이다.
+        log.insert(1, f"   쿼터(잠정): {want}"
                       + (f" · 미분류 {extra}" if extra else ""))
     # 탈락 사유가 없으면 선별이 잘못됐을 때 무엇을 고칠지 알 수 없다
     for d in drops + final.drops:
