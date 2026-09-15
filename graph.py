@@ -669,6 +669,42 @@ def ask_picks(items: list[dict], k: int, stage: str) -> Shortlist:
     return out
 
 
+# ── 같은 사건 묶기 — 라벨만으로는 안 된다 (섹션 7) ──────────
+# 실측(고정 후보 21건 · 변형별 5회):
+#   라벨만 믿기            정답 2쌍 중 0쌍 병합 · 한 회차는 12건 전부 같은 라벨(오병합 66)
+#   라벨 설명을 조인다      정답쌍이 아예 안 뽑혀 측정 불가 · 제목 그대로 쓰는 버릇은 그대로
+#   아래 코드 보강         정답 2쌍 모두 병합 · 오병합 0
+NEAR_DUP_TOKENS = 3       # 희귀 낱말 몇 개를 함께 쓰면 같은 사건으로 보나
+NEAR_DUP_MAX_DF = 3       # 후보 제목 몇 개까지 나와야 '희귀' 인가
+LABEL_MAX = 3             # 한 라벨이 이보다 많은 기사를 덮으면 작품 이름이 아니라 분야 이름이다
+
+
+def _title_tokens(t: str) -> set[str]:
+    """제목에서 고유명사 신호만 남긴다. 조사가 붙은 꼴도 함께 넣는다."""
+    out: set[str] = set()
+    for w in re.findall(r"[0-9a-zA-Z가-힣]+", (t or "").lower()):
+        if len(w) < 2:
+            continue
+        out.add(w)
+        if len(w) > 2 and re.search(r"[가-힣]$", w):
+            out.add(w[:-1])                      # '문학동네를' → '문학동네'
+    return out
+
+
+def _doc_freq(items: list[dict]) -> dict[str, int]:
+    """후보 전체에서 몇 개 제목에 나오는가 — 흔한 낱말은 신호가 아니다."""
+    df: dict[str, int] = {}
+    for it in items:
+        for w in _title_tokens(it["title"]):
+            df[w] = df.get(w, 0) + 1
+    return df
+
+
+def _near_dup(a: set[str], b: set[str], df: dict[str, int]) -> bool:
+    rare = {w for w in (a & b) if df.get(w, 0) <= NEAR_DUP_MAX_DF}
+    return len(rare) >= NEAR_DUP_TOKENS
+
+
 def select(s: dict) -> dict:
     cands = s.get("collected") or []
     if not cands:
@@ -698,14 +734,34 @@ def select(s: dict) -> dict:
     picked, seen_events, drops = [], set(), []
     filled = {g: 0 for g in QUOTA}
     overflow: list[dict] = []
+
+    # 라벨이 한 무더기를 통째로 덮으면 작품 이름이 아니라 분야 이름이다.
+    # 그대로 두면 중복 제거가 나머지를 전부 버린다 — 실측으로 12건이 1건이 될 뻔했다.
+    seen_n: dict[str, int] = {}
+    for p in final.picks:
+        e = (p.event or "").strip().lower()
+        seen_n[e] = seen_n.get(e, 0) + 1
+    broad = {e for e, n in seen_n.items() if e and n > LABEL_MAX}
+
+    df = _doc_freq(shortlist)
+    kept_tokens: list[tuple[str, set[str]]] = []
     for p in final.picks:
         it = shortlist[p.index]
-        ev = (p.event or it["title"]).strip().lower()
+        ev = (p.event or "").strip().lower()
+        if not ev or ev in broad:              # 못 믿을 라벨은 제목으로 되돌린다
+            ev = it["title"].strip().lower()
         if ev in seen_events:
             # 프롬프트에 적은 부탁은 코드로 세는 수밖에 없다 (섹션 7)
-            drops.append(f"{it['title'][:40]} — 같은 사건 중복({ev})")
+            drops.append(f"{it['title'][:40]} — 같은 사건 중복({ev[:30]})")
+            continue
+        # 라벨이 갈려도 같은 사건일 수 있다 — 제목의 희귀 낱말로 한 번 더 본다
+        tk = _title_tokens(it["title"])
+        twin = next((t for t, other in kept_tokens if _near_dup(tk, other, df)), None)
+        if twin:
+            drops.append(f"{it['title'][:40]} — 같은 사건 중복(제목 근접: {twin[:26]})")
             continue
         seen_events.add(ev)
+        kept_tokens.append((it["title"], tk))
         # 묶음은 모델이 준 토픽에서 계산한다. 취재가 끝나면 report() 가
         # 본문을 읽고 topic 을 다시 쓰므로, 이 값은 선별 단계용 잠정치다.
         # 채택 사유와 중복 판정 라벨을 함께 싣는다. 아래에서 로그로 꺼낸다 —
