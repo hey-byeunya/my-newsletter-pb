@@ -78,7 +78,7 @@ class Audience(BaseModel):
 class Source(BaseModel):
     name: str
     url: str
-    kind: str = "rss"       # rss | hn   — 사다리의 몇 칸으로 가져오는가 (섹션 3)
+    kind: str = "rss"       # rss | kcisa — 사다리의 몇 칸으로 가져오는가 (섹션 3)
     tier: int = 2           # 1 = 당사자 발표(경쟁 면제), 2 = 매체 (섹션 4)
     match: str | None = None  # filters 의 이름. 종합 피드를 주제로 좁힐 때 쓴다
     tz_offset: float | None = None  # pubDate 에 타임존이 없고 현지 시각으로 적는 발행자용
@@ -321,26 +321,6 @@ def fetch_rss(src: Source) -> list[dict]:
     return out
 
 
-def fetch_hn(src: Source) -> list[dict]:
-    """사다리 1칸 — 공개 API. RSS 에 없는 비LLM 신호(추천 수)를 함께 준다. (섹션 3)"""
-    r = requests.get(src.url, timeout=15)
-    r.raise_for_status()
-    out = []
-    for h in r.json().get("hits", []):
-        at = h.get("created_at")
-        out.append({
-            "title":        h.get("title") or "",
-            "url":          h.get("url") or f"https://news.ycombinator.com/item?id={h.get('objectID')}",
-            "source":       src.name,
-            "tier":         src.tier,
-            "at":           datetime.fromisoformat(at.replace("Z", "+00:00")) if at else None,
-            "summary":      "",
-            "points":       h.get("points"),
-            "num_comments": h.get("num_comments"),
-        })
-    return out
-
-
 PUBLISHED = ROOT / "store" / "published.jsonl"
 PUBLISHED_KEEP_DAYS = 90
 
@@ -498,8 +478,7 @@ def collect(s: dict) -> dict:
             skipped.append(src.name)
             continue
         try:
-            raw = ({"hn": fetch_hn, "kcisa": fetch_kcisa}
-                   .get(src.kind, fetch_rss))(src)
+            raw = ({"kcisa": fetch_kcisa}.get(src.kind, fetch_rss))(src)
         except Exception as exc:
             # 타입 이름만 남기면 'RuntimeError' 한 단어뿐이라 고칠 수가 없다.
             # 사유까지 실어야 로그가 진단이 된다.
@@ -576,13 +555,8 @@ class Shortlist(BaseModel):
 
 
 def _numbered(items: list[dict]) -> str:
-    lines = []
-    for i, it in enumerate(items):
-        sig = ""
-        if it.get("points") is not None:                 # 1칸이 준 신호는 근거로 쓸 수 있다
-            sig = f" [추천 {it['points']}·댓글 {it.get('num_comments', 0)}]"
-        lines.append(f"{i}. ({it['source']}) {it['title']}{sig}")
-    return "\n".join(lines)
+    return "\n".join(f"{i}. ({it['source']}) {it['title']}"
+                     for i, it in enumerate(items))
 
 
 def ask_picks(items: list[dict], k: int, stage: str) -> Shortlist:

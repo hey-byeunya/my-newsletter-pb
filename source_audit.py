@@ -22,8 +22,7 @@ try:
 except ImportError:
     pass
 
-from graph import (SET, SOURCES, ROOT, extract_body, fetch_hn, fetch_kcisa,
-                   fetch_rss)
+from graph import SET, SOURCES, ROOT, extract_body, fetch_kcisa, fetch_rss
 
 AUDIT = ROOT / "store" / "source_audit.json"
 
@@ -39,7 +38,7 @@ def measure(src, hours, sample):
 
     started = time.time()
     try:
-        raw = ({"hn": fetch_hn, "kcisa": fetch_kcisa}.get(src.kind, fetch_rss))(src)
+        raw = ({"kcisa": fetch_kcisa}.get(src.kind, fetch_rss))(src)
     except Exception as exc:                       # G3 — 접근 관문 탈락
         row["error"] = (str(exc).strip() or type(exc).__name__)[:160]
         row["elapsed"] = round(time.time() - started, 1)
