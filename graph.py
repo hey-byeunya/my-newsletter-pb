@@ -376,25 +376,6 @@ def record_published(items: list[dict]) -> None:
                                ensure_ascii=False) + "\n")
 
 
-def _kv(d: dict, *keys) -> str:
-    """응답 필드명이 판본마다 달라 후보를 순서대로 훑는다."""
-    for k in keys:
-        v = d.get(k)
-        if v not in (None, "", [], {}):
-            return str(v).strip()
-    return ""
-
-
-def _ymd(v: str) -> datetime | None:
-    digits = re.sub(r"[^0-9]", "", str(v))[:8]
-    if len(digits) != 8:
-        return None
-    try:
-        return datetime.strptime(digits, "%Y%m%d").replace(tzinfo=timezone.utc)
-    except ValueError:
-        return None
-
-
 def _kcisa_get(path: str, key: str, **params) -> ET.Element:
     """공공데이터포털은 실패 사유를 본문에 담아 준다 — 상태 코드만으로는 못 고친다.
 
@@ -1021,7 +1002,6 @@ def run(hours: int | None = None) -> dict:
 
     started = time.time()
     out = build().compile().invoke(init)
-    out["log"] = [keys] + list(out.get("log", []))
 
     # 집계는 '검수 합격분' 이 아니라 '실제 나간 것' 을 센다.
     # 이 둘이 다르다는 사실 자체가 후처리를 넣은 이유다.
@@ -1054,7 +1034,9 @@ def run(hours: int | None = None) -> dict:
         "overselect":  OVERSELECT,
         "max_per_source": SET.max_per_source,
         "elapsed_sec": round(time.time() - started, 1),
-        "log":         out.get("log", []),
+        # 키 줄은 위에서 이미 화면에 찍었다. 기록에는 남겨야 하므로 여기서만 앞에 붙인다
+        # — out["log"] 에 넣으면 run.py 가 다시 출력해 같은 줄이 두 번 찍힌다.
+        "log":         [keys] + list(out.get("log", [])),
     }
     METRICS.parent.mkdir(exist_ok=True)
     with METRICS.open("a", encoding="utf-8") as f:

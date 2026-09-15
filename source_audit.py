@@ -23,7 +23,7 @@ except ImportError:
     pass
 
 from graph import (SET, SOURCES, ROOT, extract_body, fetch_hn, fetch_kcisa,
-                   fetch_rss, published_at, _shift)
+                   fetch_rss)
 
 AUDIT = ROOT / "store" / "source_audit.json"
 
@@ -33,7 +33,7 @@ def measure(src, hours, sample):
     row = {"name": src.name, "url": src.url, "kind": src.kind,
            "local_only": bool(getattr(src, "local_only", False)),
            "match": src.match, "error": None,
-           "entries": 0, "in_window": 0,
+           "entries": 0, "in_window": 0, "undated": 0,
            "body_tried": 0, "body_ok": 0, "body_avg": 0, "body_min": 0, "body_max": 0,
            "elapsed": 0.0}
 
@@ -50,11 +50,18 @@ def measure(src, hours, sample):
     # G2 — 생존 관문. 시간 창 안에 몇 건이 살아 있는가.
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     fresh = []
+    undated = 0
     for it in raw:
         at = it.get("at")
-        if at is None or at >= cutoff:             # 날짜를 못 읽은 것은 살려 둔다(수집과 동일)
+        if not at:
+            # collect() 는 날짜를 못 읽은 항목을 창에서 함께 버린다. 여기서만
+            # 살려 두면 '창 안' 숫자가 파이프라인이 실제로 보는 것보다 부푼다.
+            undated += 1
+            continue
+        if at >= cutoff:
             fresh.append(it)
     row["in_window"] = len(fresh)
+    row["undated"] = undated                       # 버린 이유를 숫자로 남긴다
 
     # G1 — 본문 관문. 실제로 읽어서 min_body 를 넘는가. 앞에서 몇 건만 표본으로.
     lens = []
