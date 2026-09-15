@@ -69,9 +69,14 @@ sources:
 
   # ── 사다리 1칸: 국내 전시 정보는 RSS 가 없어 공공 API 로 올라간다 ──
   # 키 발급: data.go.kr → "한국문화정보원 공연전시정보" 활용 신청 → KCISA_SERVICE_KEY
+  # local_only — GitHub Actions 러너(해외 리전)에서는 이 주소에 닿지 않는다.
+  # 실측: 로컬 0.9초 성공 / 러너 ConnectTimeout 30초 x 3회. 한 번은 403 이 와서
+  # 아예 막힌 것은 아니지만 대부분 실패한다. 매일 90초를 헛쓰지 않도록 CI 에서는
+  # 건너뛰고, 건너뛴 사실만 로그에 남긴다. 국내 전시는 로컬 실행 때 들어온다.
   - name: "문화포털 전시"
     url:  "https://apis.data.go.kr/B553457/cultureinfo"   # period2 · detail2 를 부른다
     kind: "kcisa"
+    local_only: true
 
 # ── 관문에서 탈락한 소스 — 다시 넣지 않도록 이유를 남긴다 (12강) ──
 # Dezeen          : 7일 50건으로 물량 1위였으나 본문 추출 0자 (G1)

@@ -82,6 +82,7 @@ class Source(BaseModel):
     tier: int = 2           # 1 = 당사자 발표(경쟁 면제), 2 = 매체 (섹션 4)
     match: str | None = None  # filters 의 이름. 종합 피드를 주제로 좁힐 때 쓴다
     tz_offset: float | None = None  # pubDate 에 타임존이 없고 현지 시각으로 적는 발행자용
+    local_only: bool = False        # 해외 리전에서 닿지 않는 소스. CI 에서는 건너뛴다
 
 
 class Settings(BaseModel):
@@ -252,6 +253,11 @@ def _shift(at: datetime | None, offset: float | None) -> datetime | None:
 
 
 UA = {"User-Agent": "Mozilla/5.0 (compatible; newsletter-agent/1.0)"}
+
+# GitHub Actions 러너는 해외 리전이라 국내 공공 API 에 대부분 닿지 않는다.
+# 실측: 로컬 0.9초 성공 / 러너 ConnectTimeout 30초 × 3회.
+# 코드로 고칠 수 있는 문제가 아니므로, 못 닿는 곳에서는 시도조차 하지 않는다.
+IS_CI = os.environ.get("GITHUB_ACTIONS") == "true"
 
 KCISA_BASE = "https://apis.data.go.kr/B553457/cultureinfo"
 KCISA_DAYS = 14          # 앞으로 며칠 안에 열려 있는 것까지 볼 것인가
@@ -471,12 +477,17 @@ def collect(s: dict) -> dict:
 
     total, dup, off, seen_before = 0, 0, 0, 0
     off_by: dict[str, int] = {}
+    skipped: list[str] = []
     already = published_urls()
     fresh: list[dict] = []
     dead: list[str] = []
     seen: set[str] = set()
 
     for src in SOURCES:
+        if src.local_only and IS_CI:
+            # 건너뛴 것도 반드시 남긴다. 조용히 빠지면 며칠 뒤 아무도 모른다.
+            skipped.append(src.name)
+            continue
         try:
             raw = ({"hn": fetch_hn, "kcisa": fetch_kcisa}
                    .get(src.kind, fetch_rss))(src)
@@ -522,6 +533,8 @@ def collect(s: dict) -> dict:
            f"→ 상한 -{capped} → 후보 {len(kept)}건"]
     if off_by:
         log.append("   · 선필터: " + ", ".join(f"{k} -{v}" for k, v in off_by.items()))
+    if skipped:
+        log.append(f"   · 건너뜀(로컬 전용): {', '.join(skipped)}")
     if dead:
         # 이 한 줄이 없으면 소스가 조용히 빠진 채 매일 '성공'한다. (섹션 5)
         log.append(f"   · 응답 없음: {', '.join(dead)}")
